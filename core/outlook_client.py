@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.header import decode_header
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from pathlib import Path
 
 from curl_cffi.requests import Session as CurlSession
@@ -55,8 +55,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # 邮箱 → account 上下文的内存缓存，fetch_latest_otp 用
 _CONTEXT_CACHE: dict[str, "OutlookAccount"] = {}
 
-# 远端 mail.chatai.codes 被禁用时，本进程内直接跳过远端，走 Microsoft Graph 直连。
+# 旧的 mail.chatai.codes 被禁用时，本进程内直接跳过旧远端，走 Microsoft Graph 直连。
 _REMOTE_DISABLED = False
+# mail.chatai.codes 的 IMAP 端点可以单独不可用；不要因为它返回 501 就屏蔽
+# 同一服务的 Graph，也不要影响配置好的 FYUI 收件 API。
+_REMOTE_IMAP_DISABLED = False
 _MS_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 _MS_TOKEN_FATAL_CACHE: dict[str, tuple[str, float]] = {}
 
@@ -80,12 +83,19 @@ def _cache_key(email: str) -> str:
     return str(email or "").strip().lower()
 
 
-def _http_session() -> CurlSession:
+def _http_session(base_url: str | None = None) -> CurlSession:
+    configured_base = str(base_url or OUTLOOK_API_BASE or "").rstrip("/")
+    parsed = urlparse(configured_base)
+    origin = (
+        f"{parsed.scheme}://{parsed.netloc}"
+        if parsed.scheme and parsed.netloc
+        else configured_base
+    )
     s = CurlSession(impersonate=IMPERSONATE)
     s.headers.update({
         "User-Agent": USER_AGENT,
-        "Origin": OUTLOOK_API_BASE.rstrip("/"),
-        "Referer": OUTLOOK_API_BASE.rstrip("/") + "/",
+        "Origin": origin,
+        "Referer": origin + "/",
         "Accept": "*/*",
     })
     s.timeout = 30
@@ -428,6 +438,11 @@ def _is_remote_disabled_error(exc: Exception | str) -> bool:
     )
 
 
+def _is_imap_only_disabled_error(exc: Exception | str) -> bool:
+    """识别旧远端只关闭 IMAP 的响应，不扩大为整个服务不可用。"""
+    return "IMAP_REQUIRES_CONTAINER" in str(exc or "").upper()
+
+
 def _graph_folders() -> tuple[str, ...]:
     """读取 Graph 文件夹配置，默认覆盖收件箱和垃圾邮件。"""
     raw = getattr(_email_cfg, "OUTLOOK_GRAPH_FOLDERS", ("inbox", "junkemail", "deleteditems"))
@@ -441,13 +456,21 @@ def _graph_folders() -> tuple[str, ...]:
 
 
 def _fetch_protocols() -> tuple[str, ...]:
-    """返回当前取件模式需要访问的协议，避免在 Graph 直连时触发 IMAP。"""
+    """返回当前取件模式需要访问的协议。"""
     mode = _outlook_fetch_mode()
+    api_url = str(getattr(_email_cfg, "OUTLOOK_FETCH_API_URL", "") or "").strip()
+    if mode in ("fyui", "api", "fetch_api", "outlook_api"):
+        return ("fyui",)
     if mode in ("direct", "graph", "graph_direct", "msgraph"):
         return ("graph",)
+    if mode == "auto" and api_url:
+        return ("fyui",)
     if mode == "auto" and _REMOTE_DISABLED:
         return ("graph",)
-    return ("graph", "imap")
+    protocols = ["graph"]
+    if not _REMOTE_IMAP_DISABLED:
+        protocols.append("imap")
+    return tuple(protocols)
 
 
 def _clear_ms_token_cache(account: OutlookAccount) -> None:
@@ -1051,16 +1074,196 @@ def _fetch_via_graph_direct(account: OutlookAccount) -> list[dict]:
         http.close()
 
 
+def _fyui_api_url() -> str:
+    return str(getattr(_email_cfg, "OUTLOOK_FETCH_API_URL", "") or "").strip()
+
+
+def _redact_outlook_error(text: object, account: OutlookAccount) -> str:
+    """避免第三方错误响应回显 OAuth 素材。"""
+    value = str(text or "")
+    for secret in (account.refresh_token, account.client_id):
+        if secret:
+            value = value.replace(secret, "<redacted>")
+    return value[:500]
+
+
+def _extract_fyui_refresh_token(data: dict) -> str:
+    """兼容 FYUI 顶层及 credential/token 对象中的轮换字段。"""
+    containers = [data]
+    for key in ("credential", "token", "oauth"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    for container in containers:
+        for key in ("new_refresh_token", "newRefreshToken", "refresh_token", "refreshToken"):
+            value = str(container.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _normalize_fyui_message(message: dict) -> dict:
+    """把 FYUI 的 messages/codes 记录转换为现有 OTP 解析器的字段。"""
+    sender = message.get("from") or message.get("sender") or ""
+    sender_email = ""
+    sender_name = ""
+    if isinstance(sender, dict):
+        sender_email = str(
+            sender.get("address") or sender.get("email") or sender.get("emailAddress") or ""
+        ).strip()
+        sender_name = str(sender.get("name") or sender.get("displayName") or "").strip()
+    else:
+        sender_email = str(sender).strip()
+
+    content = str(
+        message.get("content")
+        or message.get("body")
+        or message.get("text")
+        or message.get("html")
+        or message.get("bodyHtml")
+        or ""
+    )
+    preview = str(message.get("preview") or message.get("bodyPreview") or "").strip()
+    codes = message.get("codes")
+    if isinstance(codes, (list, tuple)):
+        code_text = " ".join(str(item).strip() for item in codes if str(item).strip())
+    else:
+        code_text = str(message.get("code") or "").strip()
+    text = preview or content or code_text
+    content = content or text
+    received = str(
+        message.get("time")
+        or message.get("date")
+        or message.get("receivedDateTime")
+        or message.get("received_at")
+        or ""
+    ).strip()
+    mailbox = str(message.get("mailbox") or "").strip()
+    return {
+        "_fetch_source": "fyui_api",
+        "id": message.get("id") or message.get("uid") or "",
+        "subject": str(message.get("subject") or message.get("Subject") or ""),
+        "from": sender_email,
+        "fromEmail": sender_email,
+        "fromName": sender_name,
+        "sendEmail": sender_email,
+        "sendName": sender_name,
+        "receivedDateTime": received,
+        "date": received,
+        "bodyPreview": preview or text,
+        "content": content,
+        "body": content,
+        "html": content,
+        "text": text,
+        "code": code_text,
+        "codes": codes if isinstance(codes, list) else ([code_text] if code_text else []),
+        "mailbox": mailbox,
+        "folder": mailbox.lower(),
+    }
+
+
+def _fetch_via_fyui(session: CurlSession, account: OutlookAccount) -> list[dict]:
+    """通过收件网站的 OAuth API 读取 Outlook 邮件。"""
+    api_url = _fyui_api_url()
+    if not api_url:
+        raise OutlookClientError("FYUI 取件 API 未配置 OUTLOOK_FETCH_API_URL")
+
+    def _int_config(name: str, default: int, minimum: int = 1) -> int:
+        try:
+            value = int(getattr(_email_cfg, name, default) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, value)
+
+    payload = {
+        "email": account.email,
+        "clientId": account.client_id,
+        "refreshToken": account.refresh_token,
+        "mode": str(getattr(_email_cfg, "OUTLOOK_FETCH_API_MODE", "mixed") or "mixed"),
+        "mailbox": str(getattr(_email_cfg, "OUTLOOK_FETCH_API_MAILBOX", "both") or "both"),
+        "top": _int_config("OUTLOOK_FETCH_API_TOP", 10),
+        "tenant": str(getattr(_email_cfg, "OUTLOOK_FETCH_API_TENANT", "consumers") or "consumers"),
+        "endpoint": str(getattr(_email_cfg, "OUTLOOK_FETCH_API_ENDPOINT", "mail-new") or "mail-new"),
+        "timeout": _int_config("OUTLOOK_FETCH_API_TIMEOUT", 40),
+        "includeBody": bool(getattr(_email_cfg, "OUTLOOK_FETCH_API_INCLUDE_BODY", True)),
+        "returnRefreshToken": bool(getattr(_email_cfg, "OUTLOOK_FETCH_API_RETURN_REFRESH_TOKEN", True)),
+    }
+    try:
+        response = session.post(
+            api_url,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            data=json.dumps(payload, separators=(",", ":")),
+            timeout=payload["timeout"],
+        )
+    except Exception as exc:
+        raise OutlookClientError(f"FYUI 请求异常: {type(exc).__name__}: {exc}") from exc
+
+    response_text = response.text or ""
+    if response.status_code < 200 or response.status_code >= 300:
+        raise OutlookClientError(
+            f"FYUI 取件 HTTP {response.status_code}: {_redact_outlook_error(response_text, account)}"
+        )
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise OutlookClientError(
+            f"FYUI 返回不是 JSON: {_redact_outlook_error(response_text, account)}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise OutlookClientError(f"FYUI 返回格式异常: {type(data).__name__}")
+    if data.get("ok") is False or data.get("success") is False:
+        error = data.get("error") or data.get("message") or data.get("reason") or data
+        raise OutlookClientError(f"FYUI 返回失败: {_redact_outlook_error(error, account)}")
+
+    rotated_refresh = _extract_fyui_refresh_token(data)
+    rotated = False
+    if rotated_refresh:
+        rotated = _persist_rotated_refresh_token(account, rotated_refresh)
+
+    raw_messages = data.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raw_messages = data.get("emails") or data.get("items") or data.get("codes") or []
+    if not isinstance(raw_messages, list):
+        raw_messages = []
+    messages = [
+        _normalize_fyui_message(item)
+        for item in raw_messages
+        if isinstance(item, dict)
+    ]
+    logger.info(
+        "[Outlook] FYUI OAuth 取件成功: messages=%s mode=%s rotated_refresh=%s",
+        len(messages), data.get("mode_used") or data.get("mode") or "unknown", rotated,
+    )
+    return messages
+
+
 def _fetch_via(session: CurlSession, protocol: str, account: OutlookAccount) -> list[dict]:
     """
     拉收件箱，返回 emails 列表。
 
+    - fyui: OUTLOOK_FETCH_API_URL /api/fetch
     - remote: mail.chatai.codes /api/fetch-graph|imap
     - direct: Microsoft Graph 直连
     - auto: 远端可用时用远端；远端 402/DEPLOYMENT_DISABLED 后自动直连 Graph
     """
     global _REMOTE_DISABLED
+    global _REMOTE_IMAP_DISABLED
     mode = _outlook_fetch_mode()
+
+    if protocol == "fyui":
+        try:
+            return _fetch_via_fyui(session, account)
+        except OutlookClientError as exc:
+            logger.warning("[Outlook] FYUI 请求失败: %s", exc)
+            # auto 模式下保留 Microsoft Graph 作为后备；显式 fyui 模式不偷偷
+            # 改走其它服务，便于定位收件网站本身的问题。
+            if mode == "auto":
+                return _fetch_via_graph_direct(account)
+            return []
 
     if mode in ("direct", "graph", "graph_direct", "msgraph"):
         if protocol == "graph":
@@ -1089,6 +1292,10 @@ def _fetch_via(session: CurlSession, protocol: str, account: OutlookAccount) -> 
         data = _secure_post(session, url, payload)
     except OutlookClientError as exc:
         logger.warning(f"[Outlook] {protocol} 请求失败: {exc}")
+        if protocol == "imap" and _is_imap_only_disabled_error(exc):
+            _REMOTE_IMAP_DISABLED = True
+            logger.warning("[Outlook] 旧远端 IMAP 端点不可用，后续仅跳过 IMAP，保留 Graph/FYUI")
+            return []
         if mode == "auto" and _is_remote_disabled_error(exc):
             _REMOTE_DISABLED = True
             logger.warning("[Outlook] 远端取件服务已禁用，自动切换为 Microsoft Graph 直连模式")
@@ -1183,10 +1390,10 @@ def fetch_latest_otp(
     deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
     settle = settle_seconds if settle_seconds is not None else OTP_SETTLE_SECONDS
-    session = _http_session()
+    session = _http_session(_fyui_api_url() or OUTLOOK_API_BASE)
 
     logger.info(
-        f"[Outlook] 开始轮询 {email} 的收件箱（mode={_outlook_fetch_mode()}, Graph + IMAP 本地直连，REST 兜底），"
+        f"[Outlook] 开始轮询 {email} 的收件箱（mode={_outlook_fetch_mode()}, protocols={','.join(_fetch_protocols())}），"
         f"最长 {max_wait or _email_cfg.OTP_MAX_WAIT}s, settle={settle}s..."
     )
 
@@ -1320,6 +1527,16 @@ def _parse_email_ts(item: dict) -> float | None:
     )
     if not raw:
         return None
+
+    # FYUI 返回 ISO 8601 的 +00:00/-07:00 偏移格式，先用标准解析器保留时区。
+    try:
+        iso_raw = str(raw).strip()
+        parsed = datetime.fromisoformat(iso_raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        pass
 
     formats = (
         "%Y-%m-%dT%H:%M:%SZ",       # Graph: 2026-05-08T02:47:00Z

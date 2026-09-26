@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+import json
 from unittest.mock import patch
 
 from core import outlook_client
@@ -105,10 +106,88 @@ class OutlookClientContextTests(unittest.TestCase):
         error = '{"code":"IMAP_REQUIRES_CONTAINER","error":"IMAP TCP/TLS is unavailable"}'
 
         self.assertTrue(outlook_client._is_remote_disabled_error(error))
+        self.assertTrue(outlook_client._is_imap_only_disabled_error(error))
 
     @patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_MODE", "direct")
     def test_direct_mode_only_fetches_graph(self):
         self.assertEqual(outlook_client._fetch_protocols(), ("graph",))
+
+    @patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_MODE", "auto")
+    @patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_API_URL", "https://fyui.test/api/fetch")
+    def test_auto_mode_prefers_configured_fetch_api(self):
+        self.assertEqual(outlook_client._fetch_protocols(), ("fyui",))
+
+    def test_fyui_message_is_compatible_with_otp_parser(self):
+        item = outlook_client._normalize_fyui_message({
+            "id": "message-1",
+            "subject": "Your temporary ChatGPT login code",
+            "from": {"name": "ChatGPT", "address": "noreply@tm.openai.com"},
+            "time": "2026-09-26T10:35:27+00:00",
+            "preview": "Enter this temporary verification code to continue: 595718",
+            "codes": ["595718"],
+            "mailbox": "INBOX",
+        })
+
+        self.assertTrue(outlook_client.looks_like_openai_email(item))
+        self.assertEqual(outlook_client.extract_otp(item), "595718")
+        self.assertGreater(outlook_client._parse_email_ts(item), 0)
+
+    @patch.object(outlook_client, "_persist_rotated_refresh_token", return_value=True)
+    def test_fyui_fetch_normalizes_messages_and_persists_rotated_token(self, persist):
+        class _Response:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return {
+                    "ok": True,
+                    "mode_used": "oauth2",
+                    "messages": [{
+                        "index": 1,
+                        "id": "message-1",
+                        "subject": "Your temporary ChatGPT login code",
+                        "from": {"name": "ChatGPT", "address": "noreply@tm.openai.com"},
+                        "time": "2026-09-26T10:35:27+00:00",
+                        "preview": "verification code 595718",
+                        "codes": ["595718"],
+                        "mailbox": "INBOX",
+                    }],
+                    "new_refresh_token": "rotated-refresh-token",
+                }
+
+        class _Session:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return _Response()
+
+        account = outlook_client.OutlookAccount("mail@outlook.test", "password", "client", "old-refresh")
+        session = _Session()
+        rows = outlook_client._fetch_via_fyui(session, account)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(outlook_client.extract_otp(rows[0]), "595718")
+        self.assertEqual(rows[0]["_fetch_source"], "fyui_api")
+        persist.assert_called_once_with(account, "rotated-refresh-token")
+        self.assertEqual(json.loads(session.calls[0][1]["data"])["clientId"], "client")
+        self.assertEqual(json.loads(session.calls[0][1]["data"])["returnRefreshToken"], True)
+
+    @patch.object(outlook_client, "_secure_post", side_effect=outlook_client.OutlookClientError(
+        '{"code":"IMAP_REQUIRES_CONTAINER"}'
+    ))
+    @patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_MODE", "remote")
+    def test_imap_container_error_disables_only_remote_imap(self, secure_post):
+        account = outlook_client.OutlookAccount("mail@outlook.test", "password", "client", "refresh")
+        with patch.object(outlook_client, "_REMOTE_DISABLED", False), \
+             patch.object(outlook_client, "_REMOTE_IMAP_DISABLED", False):
+            rows = outlook_client._fetch_via(object(), "imap", account)
+
+            self.assertEqual(rows, [])
+            self.assertFalse(outlook_client._REMOTE_DISABLED)
+            self.assertTrue(outlook_client._REMOTE_IMAP_DISABLED)
+        secure_post.assert_called_once()
 
     @patch("core.db.update_outlook_credentials", return_value={"pool": True, "accounts": 1, "changed": True})
     def test_rotated_refresh_token_is_persisted_and_replaces_context(self, update_credentials):

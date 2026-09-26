@@ -396,7 +396,43 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "OUTLOOK_FETCH_MODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "Outlook取件模式", "help": "auto=远端优先，远端 402/DEPLOYMENT_DISABLED 自动切 Graph 直连；direct=只用 Microsoft Graph 直连；remote=只用远端服务",
+        "label": "Outlook取件模式", "help": "auto=优先收件 API；fyui=只用收件 API；direct=只用 Microsoft Graph；remote=旧 mail.chatai.codes",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_URL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Outlook收件 API", "help": "收件网站 OAuth 接口，例如 https://fyui.top/api/fetch；请求成功后自动保存 new_refresh_token",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_MODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Outlook API模式", "help": "FYUI 请求 mode，默认 mixed",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Outlook邮箱范围", "help": "FYUI mailbox，默认 both",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_TENANT", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Outlook租户", "help": "FYUI tenant，个人 Outlook 默认 consumers",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_ENDPOINT", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Outlook API端点", "help": "FYUI endpoint，默认 mail-new",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_TOP", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Outlook邮件数量", "help": "每次最多读取的邮件数量",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Outlook API超时", "help": "收件网站请求超时秒数",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_INCLUDE_BODY", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
+        "label": "读取邮件正文", "help": "开启后使用正文解析验证码",
+    },
+    {
+        "key": "OUTLOOK_FETCH_API_RETURN_REFRESH_TOKEN", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
+        "label": "请求最新 refresh_token", "help": "要求收件 API 返回轮换后的 refresh_token 并自动保存",
     },
     {
         "key": "OUTLOOK_GRAPH_FOLDERS", "file": "email.py", "type": "list_str_multiline", "group": "邮箱 / OTP",

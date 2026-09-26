@@ -280,6 +280,25 @@ email----password----clientId----refreshToken
 
 也可以在 WebUI 的「邮箱池」页面导入。
 
+Outlook 取件默认优先使用收件网站 OAuth API。当前内置 `fyui.top` 适配，配置示例：
+
+```dotenv
+EMAIL_SOURCE="outlook"
+OUTLOOK_FETCH_MODE="auto"
+OUTLOOK_FETCH_API_URL="https://fyui.top/api/fetch"
+OUTLOOK_FETCH_API_MODE="mixed"
+OUTLOOK_FETCH_API_MAILBOX="both"
+OUTLOOK_FETCH_API_TENANT="consumers"
+OUTLOOK_FETCH_API_ENDPOINT="mail-new"
+OUTLOOK_FETCH_API_TOP="10"
+OUTLOOK_FETCH_API_TIMEOUT="40"
+OUTLOOK_FETCH_API_INCLUDE_BODY="True"
+OUTLOOK_FETCH_API_RETURN_REFRESH_TOKEN="True"
+OUTLOOK_TOKEN_AUTO_ROTATE="True"
+```
+
+`auto` 会优先调用 `OUTLOOK_FETCH_API_URL`；也可以用 `fyui` 只走该接口。接口返回的 `messages/codes` 会转换为项目统一的 OTP 格式，`new_refresh_token` 会自动写回邮箱池和同邮箱的已注册账号。需要回到旧 `mail.chatai.codes` 流程时，将 `OUTLOOK_FETCH_MODE` 改为 `remote`；Graph 直连模式使用 `direct`。
+
 #### 通用 API 邮箱
 
 每行格式：
@@ -518,9 +537,9 @@ pip install playwright
 
 - Browser Use 走远端 stealth Chromium，通过 Playwright `connect_over_cdp` 控制。
 - `BROWSER_USE_SESSION_TIMEOUT=240` 会在 Browser Use 创建/连接远端浏览器时设置较长 keepAlive（connect URL 的 `timeout` 参数，单位分钟），避免等待邮箱 OTP、短信或 callback 时云端会话提前回收；代码会限制到 `1~240`。
-- 如果第一次进入邮箱验证码页且邮箱里实际已有验证码，但程序没取到，通常是 Outlook 取件链路抖动：Graph TLS/REST/IMAP 某一轮失败、短轮询切片过短、或 `after_ts` 过滤边界过紧。Browser Use 驱动已放宽 Outlook 单轮取件切片、提前记录验证码过滤时间，并会在等待邮箱 OTP 超时后尝试点击重发继续等待；重发入口使用 DOM 结构/位置/属性启发式定位，不依赖页面文案或 OCR/文字识别。可在「邮箱 / OTP」把 `OTP_MAX_WAIT` 调大到 `180~240`，`OUTLOOK_FETCH_MODE` 优先用 `auto`。
-- Outlook 取件日志会显示验证码来源：`source=graph`、`source=outlook_rest`、`source=imap_new`、`source=imap_entra_outlook`、`source=remote_graph` 或 `source=remote_imap`，便于判断是哪条链路成功取码。
-- 当前项目可直接用 Microsoft Graph 取件，不依赖 `mail.chatai.codes` 的 IMAP Worker。建议在 `.env` 设置 `OUTLOOK_FETCH_MODE=direct`；程序会扫描 `inbox`、`junkemail`、`deleteditems`，并在 Microsoft 返回轮换后的 `refresh_token` 时自动写回邮箱池和已注册账号。已有素材的旧 `refresh_token` 失效时，需从邮箱平台导出最新 4 段凭据，在 WebUI 导入框勾选“同邮箱已存在时更新 Outlook 凭据”。
+- 如果第一次进入邮箱验证码页且邮箱里实际已有验证码，但程序没取到，通常先检查 Outlook 收件 API 日志中的 `messages` 数量、`mode_used` 和 `source=fyui_api`。可在「邮箱 / OTP」把 `OTP_MAX_WAIT` 调大到 `180~240`；`after_ts` 只过滤触发本次登录之前的旧邮件。
+- Outlook 取件日志会显示验证码来源：`source=fyui_api`、`source=graph`、`source=outlook_rest`、`source=imap_new`、`source=imap_entra_outlook`、`source=remote_graph` 或 `source=remote_imap`，便于判断是哪条链路成功取码。
+- FYUI API 返回的轮换 `refresh_token` 会自动写回邮箱池和已注册账号；如果 API 返回 OAuth 错误，再在 WebUI 导入框勾选“同邮箱已存在时更新 Outlook 凭据”导入最新 4 段凭据，或切换到 `OUTLOOK_FETCH_MODE=direct` 检查 Microsoft Graph 权限。
 - `BROWSER_USE_FAST_MODE=True` 会跳过大部分人工节奏等待；`BROWSER_USE_LOG_TIMING=True` 会打印连接、打开页面、邮箱、OTP、手机、callback 等阶段耗时。
 - 支持作为 Codex OAuth 授权驱动：`CODEX_OAUTH_DRIVER="browser_use"`，可完成授权页面、邮箱 OTP、手机短信验证与 callback 捕获。
 - 适合不想安装本机 Roxy、又想要 session 隔离 + 云端代理的场景。

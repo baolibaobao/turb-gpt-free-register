@@ -34,10 +34,23 @@ EMAIL_SOURCE = "outlook,generic_api,mailnest"
 OUTLOOK_ACCOUNTS_FILE = "用于注册的邮箱.txt"
 
 # Outlook 取件模式：
-#   "auto"   = 先用远端 mail.chatai.codes；远端 402/DEPLOYMENT_DISABLED 时自动切 Microsoft Graph 直连
-#   "remote" = 只用远端 mail.chatai.codes
+#   "auto"   = 已配置 FYUI API 时优先使用，否则按旧远端/Graph 流程
+#   "fyui"   = 只使用 OUTLOOK_FETCH_API_URL
+#   "remote" = 只用旧的 mail.chatai.codes 远端接口
 #   "direct" = 只用 Microsoft Graph 直连（使用 clientId + refreshToken 换 access_token）
 OUTLOOK_FETCH_MODE = "auto"
+
+# FYUI/收件网站的 Outlook OAuth 取件接口。请求只发送当前邮箱的 OAuth 素材，
+# 响应中的 new_refresh_token 会按 OUTLOOK_TOKEN_AUTO_ROTATE 写回本地。
+OUTLOOK_FETCH_API_URL = "https://fyui.top/api/fetch"
+OUTLOOK_FETCH_API_MODE = "mixed"
+OUTLOOK_FETCH_API_MAILBOX = "both"
+OUTLOOK_FETCH_API_TENANT = "consumers"
+OUTLOOK_FETCH_API_ENDPOINT = "mail-new"
+OUTLOOK_FETCH_API_TOP = 10
+OUTLOOK_FETCH_API_TIMEOUT = 40
+OUTLOOK_FETCH_API_INCLUDE_BODY = True
+OUTLOOK_FETCH_API_RETURN_REFRESH_TOKEN = True
 
 # Graph 取件文件夹。OpenAI 发给陌生 Outlook 收件人的首封验证码，
 # 经常会先进入 Junk Email；保留 deleteditems 便于排查被规则移动的邮件。
@@ -193,4 +206,4 @@ REMAIL_ORDER_WAIT_SECONDS = 30
 REMAIL_REQUEST_TIMEOUT = 20
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'OTP_SETTLE_SECONDS': 'int', 'GENERIC_API_PROXY': 'str', 'EMAIL_SOURCE': 'str', 'IMAP_MAILBOX': 'str', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'OUTLOOK_GRAPH_FOLDERS': 'list_str_multiline', 'OUTLOOK_TOKEN_AUTO_ROTATE': 'bool', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'OTP_SETTLE_SECONDS': 'int', 'GENERIC_API_PROXY': 'str', 'EMAIL_SOURCE': 'str', 'IMAP_MAILBOX': 'str', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'OUTLOOK_FETCH_API_URL': 'str', 'OUTLOOK_FETCH_API_MODE': 'str', 'OUTLOOK_FETCH_API_MAILBOX': 'str', 'OUTLOOK_FETCH_API_TENANT': 'str', 'OUTLOOK_FETCH_API_ENDPOINT': 'str', 'OUTLOOK_FETCH_API_TOP': 'int', 'OUTLOOK_FETCH_API_TIMEOUT': 'int', 'OUTLOOK_FETCH_API_INCLUDE_BODY': 'bool', 'OUTLOOK_FETCH_API_RETURN_REFRESH_TOKEN': 'bool', 'OUTLOOK_GRAPH_FOLDERS': 'list_str_multiline', 'OUTLOOK_TOKEN_AUTO_ROTATE': 'bool', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})
