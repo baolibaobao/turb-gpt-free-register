@@ -2,6 +2,8 @@ curl_cffi>=0.15.0
 pyotp>=2.9.0
 flask>=3.0.0
 requests>=2.31.0
+PyYAML>=6.0.2
+psutil>=6.1
 pycryptodome>=3.23.0
 selenium>=4.20.0
 

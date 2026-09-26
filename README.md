@@ -475,7 +475,11 @@ CLOAK_USER_DATA_DIR = ""        # 留空临时环境；填路径可持久化 pro
 REGISTRATION_DRIVER = "protocol"
 ```
 
-协议注册会使用 `curl_cffi`、Sentinel/PoW、代理池等配置。
+协议注册会使用 `curl_cffi`、Sentinel/PoW、代理池等配置。项目内置的
+`sentinel/sentinel-runner.js` 会在 Node VM 中执行真实 `sentinel/sdk.js`；
+注册时会在首次 Auth 发码判定前生成 `authorize_continue` token，并随导航或
+`/api/accounts/authorize/continue` 请求发送。这样可以避免接口表面返回成功、
+但服务端深层 Sentinel 校验失败而静默不发送 OTP 的情况。需要 Node.js 18+。
 
 #### 使用 Browser Use Cloud 注册
 
@@ -516,6 +520,7 @@ pip install playwright
 - `BROWSER_USE_SESSION_TIMEOUT=240` 会在 Browser Use 创建/连接远端浏览器时设置较长 keepAlive（connect URL 的 `timeout` 参数，单位分钟），避免等待邮箱 OTP、短信或 callback 时云端会话提前回收；代码会限制到 `1~240`。
 - 如果第一次进入邮箱验证码页且邮箱里实际已有验证码，但程序没取到，通常是 Outlook 取件链路抖动：Graph TLS/REST/IMAP 某一轮失败、短轮询切片过短、或 `after_ts` 过滤边界过紧。Browser Use 驱动已放宽 Outlook 单轮取件切片、提前记录验证码过滤时间，并会在等待邮箱 OTP 超时后尝试点击重发继续等待；重发入口使用 DOM 结构/位置/属性启发式定位，不依赖页面文案或 OCR/文字识别。可在「邮箱 / OTP」把 `OTP_MAX_WAIT` 调大到 `180~240`，`OUTLOOK_FETCH_MODE` 优先用 `auto`。
 - Outlook 取件日志会显示验证码来源：`source=graph`、`source=outlook_rest`、`source=imap_new`、`source=imap_entra_outlook`、`source=remote_graph` 或 `source=remote_imap`，便于判断是哪条链路成功取码。
+- 当前项目可直接用 Microsoft Graph 取件，不依赖 `mail.chatai.codes` 的 IMAP Worker。建议在 `.env` 设置 `OUTLOOK_FETCH_MODE=direct`；程序会扫描 `inbox`、`junkemail`、`deleteditems`，并在 Microsoft 返回轮换后的 `refresh_token` 时自动写回邮箱池和已注册账号。已有素材的旧 `refresh_token` 失效时，需从邮箱平台导出最新 4 段凭据，在 WebUI 导入框勾选“同邮箱已存在时更新 Outlook 凭据”。
 - `BROWSER_USE_FAST_MODE=True` 会跳过大部分人工节奏等待；`BROWSER_USE_LOG_TIMING=True` 会打印连接、打开页面、邮箱、OTP、手机、callback 等阶段耗时。
 - 支持作为 Codex OAuth 授权驱动：`CODEX_OAUTH_DRIVER="browser_use"`，可完成授权页面、邮箱 OTP、手机短信验证与 callback 捕获。
 - 适合不想安装本机 Roxy、又想要 session 隔离 + 云端代理的场景。

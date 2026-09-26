@@ -324,6 +324,8 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    from webui.proxy_subscription import create_proxy_blueprint
+    app.register_blueprint(create_proxy_blueprint())
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
@@ -1639,6 +1641,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API 或通用 IMAP"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
+        update_existing = bool(data.get("update_existing", False))
         imap_server = str(data.get("imap_server") or "").strip()
         try:
             imap_port = int(data.get("imap_port") or 993)
@@ -1699,6 +1702,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     "邮箱----IMAP密码 或 邮箱:IMAP密码" if source == "imap" else
                     "4 段：email----password----clientId----refreshToken")
             return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，---- 或 ==== 分隔）"}), 400
+        updated = 0
         if as_registered:
             inserted, skipped = db.import_registered_email_accounts(records, source=source)
         elif source == "generic_api":
@@ -1706,10 +1710,21 @@ def create_app(auth_code: str | None = None) -> Flask:
         elif source == "imap":
             inserted, skipped = db.import_imap_emails(records)
         else:
-            inserted, skipped = db.import_outlook_accounts(records)
+            if update_existing and not as_registered:
+                inserted, updated, skipped = db.upsert_outlook_accounts(records)
+                try:
+                    from core import outlook_client
+                    for record in records:
+                        outlook_client.invalidate_account_context(record.get("email") or "")
+                except Exception:
+                    pass
+            else:
+                inserted, skipped = db.import_outlook_accounts(records)
+                updated = 0
         return jsonify({
             "ok": True,
             "inserted": inserted,
+            "updated": updated,
             "skipped": skipped,
             "parsed": len(records),
             "as_registered": as_registered,
@@ -1735,6 +1750,24 @@ def create_app(auth_code: str | None = None) -> Flask:
         else:
             db.release_outlook(email, status=status, note=data.get("note"))
         return jsonify({"ok": True})
+
+    @app.post("/api/outlook/refresh")
+    def api_outlook_refresh():
+        """主动用当前 Outlook refresh_token 换 token，并保存微软返回的轮换值。"""
+        data = request.get_json(silent=True) or {}
+        email = str(data.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        try:
+            from core.outlook_client import refresh_account_token
+            result = refresh_account_token(email)
+            return jsonify({"ok": True, **result})
+        except Exception as exc:
+            logger.warning("[Outlook] 主动刷新 token 失败 email=%s: %s: %s", email, type(exc).__name__, str(exc)[:240])
+            return jsonify({
+                "ok": False,
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            }), 502
 
     @app.post("/api/outlook/status-bulk")
     def api_outlook_status_bulk():

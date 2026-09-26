@@ -20,22 +20,22 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 
-def _latest_chrome_major(default: str = "146") -> str:
+def _latest_chrome_major(default: str = "150") -> str:
     """兼容旧模块导入；必须与 curl_cffi 实际 TLS impersonate 版本一致。"""
     return default
 
 
-CHROME_MAJOR = "146"
-CHROME_FULL_VERSION = "146.0.0.0"
+CHROME_MAJOR = "150"
+CHROME_FULL_VERSION = "150.0.0.0"
 
 SAFARI_VERSION = ""
 SAFARI_WEBKIT_VERSION = "537.36"
 MAC_OS_UA_VERSION = "10_15_7"
 
 # ---------- curl_cffi 模拟浏览器 ----------
-# curl_cffi 0.15 当前最高内置到 chrome146。UA、Client Hints、JS navigator
-# 必须同步为 146；不能出现 TLS=146、HTTP/JS=149 的跨版本拼接指纹。
-IMPERSONATE = "chrome146"
+# 当前环境的 curl_cffi 支持 chrome150；UA、Client Hints、JS navigator 必须同步。
+# 实测同一出口下 chrome146 会收到 Cloudflare challenge，而 chrome150 可正常返回登录页。
+IMPERSONATE = "chrome150"
 
 # ---------- 桌面 Chrome 画像 ----------
 BROWSER_FAMILY = "chrome"
@@ -50,8 +50,8 @@ USER_AGENT = (
     f"Chrome/{CHROME_FULL_VERSION} Safari/{SAFARI_WEBKIT_VERSION}"
 )
 
-SEC_CH_UA = '"Google Chrome";v="146", "Chromium";v="146", "Not)A;Brand";v="24"'
-SEC_CH_UA_FULL_VERSION_LIST = '"Google Chrome";v="146.0.0.0", "Chromium";v="146.0.0.0", "Not)A;Brand";v="24.0.0.0"'
+SEC_CH_UA = '"Google Chrome";v="150", "Chromium";v="150", "Not)A;Brand";v="24"'
+SEC_CH_UA_FULL_VERSION_LIST = '"Google Chrome";v="150.0.0.0", "Chromium";v="150.0.0.0", "Not)A;Brand";v="24.0.0.0"'
 SEC_CH_UA_PLATFORM = '"macOS"'
 SEC_CH_UA_PLATFORM_VERSION = '"15.7.0"'
 SEC_CH_UA_MOBILE = "?0"
@@ -71,8 +71,8 @@ IP_GEO_ENDPOINTS = [
     "https://ipwho.is/",
 ]
 
-# 代理出口质量诊断：默认不拦截，只在手动开启时拒绝云厂商/DC ASN。
-# 用户可能明确使用固定云出口复现实验抓包，因此默认 False。
+# 代理出口质量诊断：默认不拦截，仅在手动开启时拒绝云厂商/DC ASN。
+# 固定云出口也可能在真实浏览器流程中正常工作，因此不把 ASN 当作唯一判定。
 REJECT_CLOUD_PROXY = False
 CLOUD_PROXY_ORG_KEYWORDS = [
     "amazon", "aws", "google cloud", "google llc", "microsoft", "azure",

@@ -97,12 +97,16 @@ def normalize_proxy_list(values, default_scheme: str = "http") -> list[str]:
 
 
 def pick_proxy() -> str:
-    """从代理池中随机抽取一个代理 URL；池为空时返回空串（即不使用代理）。"""
+    """优先使用项目独立订阅节点；停用时使用原有代理池。"""
+    from core.mihomo_proxy import managed_proxy_url
+    managed = managed_proxy_url()
+    if managed:
+        return managed
     return random.choice(PROXY_POOL) if PROXY_POOL else ""
 
 
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理
-PROXY = pick_proxy()
+PROXY = random.choice(PROXY_POOL) if PROXY_POOL else ""
 
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
@@ -122,4 +126,4 @@ apply_env_overrides(globals(), {
 })
 PROXY_POOL = normalize_proxy_list(PROXY_POOL)
 PLAN_CHECK_PROXY = normalize_proxy_list(PLAN_CHECK_PROXY)
-PROXY = pick_proxy()
+PROXY = random.choice(PROXY_POOL) if PROXY_POOL else ""

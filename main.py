@@ -9,6 +9,7 @@ import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
 # 可热改的，按模块属性方式读
@@ -20,12 +21,18 @@ from core.session import BrowserSession
 from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
 from core.openai_auth import (
     follow_authorize,
+    authorize_continue,
     request_sentinel_token,
     build_sentinel_header,
+    prepare_authorize_sentinel,
     validate_email_otp,
     send_email_otp,
     network_preflight,
     navigate_about_you,
+    navigate_email_otp_send,
+    open_create_account_password,
+    register_user,
+    generate_registration_password,
     EmailOtpInvalidError,
     create_account,
 )
@@ -72,6 +79,45 @@ def configure_logging(verbose: bool = False) -> None:
 def _is_success(result: dict) -> bool:
     """判断单次注册结果是否成功，集中收敛批量统计规则。"""
     return isinstance(result, dict) and bool(result.get("success"))
+
+
+def _safe_proxy_label(proxy: str | None) -> str:
+    """生成不泄露凭据的代理日志标签；无认证代理保留真实端点。"""
+    raw = str(proxy or "").strip()
+    if not raw:
+        return "无"
+    try:
+        parsed = urlsplit(raw)
+        scheme = parsed.scheme or "proxy"
+        host = parsed.hostname or ""
+        if host:
+            host_display = f"[{host}]" if ":" in host and not host.startswith("[") else host
+            endpoint = f"{host_display}:{parsed.port}" if parsed.port else host_display
+        else:
+            endpoint = parsed.netloc.rsplit("@", 1)[-1] or raw
+        if parsed.username or parsed.password:
+            sid_part = next(
+                (seg for seg in (parsed.username or "").split("-") if len(seg) == 8),
+                "***",
+            )
+            return f"{scheme}://...sid-{sid_part}...@{endpoint}"
+        return raw
+    except (AttributeError, ValueError):
+        return "已配置"
+
+
+def _authorize_bootstrap_url(authorize_url: str) -> str:
+    """Keep OAuth state while deferring the email decision to Auth JSON API."""
+    try:
+        parsed = urlsplit(str(authorize_url or ""))
+        params = [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key != "login_hint"
+        ]
+        return parsed._replace(query=urlencode(params)).geturl()
+    except Exception:
+        return authorize_url
 
 
 def _finalize_registration_session(
@@ -248,18 +294,8 @@ def run_registration(
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
     session = BrowserSession(proxy=proxy)
 
-    # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
-    proxy_label = "无"
-    if session.proxy:
-        # 形如 socks5h://user-region-JP-sid-XXXX-t-5:pass@host:port
-        try:
-            sid_part = next(
-                (seg for seg in session.proxy.split("@")[0].split("-") if len(seg) == 8),
-                "***",
-            )
-            proxy_label = f"{session.proxy.split('://')[0]}://...sid-{sid_part}...@{session.proxy.split('@')[-1]}"
-        except Exception:
-            proxy_label = "已配置"
+    # 认证代理只记录 sid 摘要；本地无认证入口保留真实端点，避免误显示为链式代理。
+    proxy_label = _safe_proxy_label(session.proxy)
 
     if not birthday:
         birthday = generate_random_birthday()
@@ -269,6 +305,7 @@ def run_registration(
     logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
 
     create_acknowledged = False
+    registration_password = None
     try:
         # 网络预检必须在 signin/follow_authorize 之前完成；预检不带邮箱，不会触发 OTP。
         network_preflight(session)
@@ -296,21 +333,165 @@ def run_registration(
         authorize_url = signin_openai(session, csrf_token, email)
         human_delay("api")
 
+        # ==================== 阶段2: OpenAI Auth ====================
+        # 真实 SDK Sentinel 必须在首次发码判定前完成。旧流程只在拿到 OTP
+        # 后才生成 token，服务端因此可能返回 email-verification 页面但静默丢弃邮件。
+        authorize_sentinel_header = None
+        authorize_so_header = None
+        if getattr(_protocol_cfg, "SEND_SENTINEL_BEFORE_AUTHORIZE", True):
+            authorize_sentinel_header, authorize_so_header = prepare_authorize_sentinel(session)
+
         # 记录"OTP 触发"前的时间戳，自动取信箱时只看此后的邮件，
         # 避免取到上次注册留下的旧 OTP。
         otp_after_ts = time.time()
 
-        # ==================== 阶段2: OpenAI Auth ====================
-        # 步骤4: 跟随 authorize URL（建立 auth.openai.com 的 cookies）
-        # 由于步骤3已携带 login_hint + screen_hint=login_or_signup，
-        # 重定向链会直接走到 /email-verification 并自动触发 OTP 发送，
-        # 不需要 /create-account/password、register_user、单独 send_email_otp 调用。
-        follow_authorize(session, authorize_url)
+        # 先建立 OAuth/Auth 会话。显式模式移除 login_hint，避免 GET 导航
+        # 抢先触发一次未携带正确 Sentinel 的 OTP；随后由 authorize/continue
+        # 用真实 SDK token 提交邮箱。若当前部署仍在导航阶段自动发码，保留
+        # 兼容路径并直接使用导航结果。
+        authorize_navigation_url = authorize_url
+        if getattr(_protocol_cfg, "USE_EXPLICIT_AUTHORIZE_CONTINUE", True):
+            authorize_navigation_url = _authorize_bootstrap_url(authorize_url)
+        final_authorize_url = follow_authorize(
+            session,
+            authorize_navigation_url,
+            sentinel_header=authorize_sentinel_header,
+            so_header=authorize_so_header,
+        )
+
+        auth_step = None
+        if (
+            getattr(_protocol_cfg, "USE_EXPLICIT_AUTHORIZE_CONTINUE", True)
+            and "/email-verification" not in str(final_authorize_url or "")
+        ):
+            if not authorize_sentinel_header:
+                authorize_sentinel_header, authorize_so_header = prepare_authorize_sentinel(session)
+            auth_step = authorize_continue(
+                session,
+                email,
+                authorize_sentinel_header,
+                authorize_so_header,
+                screen_hint="signup",
+            )
+
+            auth_page = auth_step.get("page") if isinstance(auth_step, dict) else {}
+            auth_page = auth_page if isinstance(auth_page, dict) else {}
+            auth_page_type = str(auth_page.get("type") or "")
+            auth_page_payload = (
+                auth_page.get("payload")
+                if isinstance(auth_page.get("payload"), dict)
+                else {}
+            )
+            auth_email_verification_mode = str(
+                auth_page_payload.get("email_verification_mode") or ""
+            ).strip().lower()
+            auth_continue_url = (
+                auth_step.get("continue_url")
+                or auth_step.get("external_url")
+                or auth_step.get("url")
+                or auth_page.get("continue_url")
+                or auth_page.get("external_url")
+                or auth_page.get("url")
+            )
+            auth_continue_text = str(auth_continue_url or "")
+
+            # Older/newer Auth variants can still select the password branch.
+            # Keep it working while ensuring both the password registration and
+            # subsequent email-otp/send carry a token from the matching flow.
+            if auth_page_type in ("create_account_password", "create-account-password") or "/create-account/password" in auth_continue_text:
+                registration_password = generate_registration_password()
+                open_create_account_password(session)
+                password_sentinel = request_sentinel_token(session, "username_password_create")
+                password_header, password_so_header = build_sentinel_header(
+                    session,
+                    password_sentinel,
+                    "username_password_create",
+                )
+                register_result = register_user(
+                    session,
+                    email,
+                    registration_password,
+                    password_header,
+                    password_so_header,
+                )
+                authorize_sentinel_header = password_header
+                authorize_so_header = password_so_header
+                # 记录实际发码请求之前的时间，避免 issued_after 过滤掉刚发出的邮件。
+                otp_after_ts = time.time()
+                navigate_email_otp_send(
+                    session,
+                    register_result.get("continue_url") if isinstance(register_result, dict) else None,
+                    sentinel_header=password_header,
+                    so_header=password_so_header,
+                )
+            elif (
+                auth_page_type in ("email_otp_send", "email-otp-send")
+                or "/email-otp/send" in auth_continue_text
+            ) and "/email-verification" not in auth_continue_text:
+                navigate_email_otp_send(
+                    session,
+                    auth_continue_url,
+                    sentinel_header=authorize_sentinel_header,
+                    so_header=authorize_so_header,
+                )
+            elif (
+                auth_page_type in ("email_otp_verification", "email-verification")
+                and auth_email_verification_mode == "passwordless_signup"
+            ):
+                # 参考项目的 passwordless_signup 分支：authorize/continue 只建立
+                # 邮箱验证状态；先设定注册密码，再显式访问 email-otp/send，
+                # 否则服务端可能只返回验证码页面而不真正投递邮件。
+                logger.info(
+                    "[Auth] 检测到 passwordless_signup：先提交注册密码，再显式触发 OTP"
+                )
+                registration_password = generate_registration_password()
+                open_create_account_password(session)
+                password_sentinel = request_sentinel_token(session, "username_password_create")
+                password_header, password_so_header = build_sentinel_header(
+                    session,
+                    password_sentinel,
+                    "username_password_create",
+                )
+                register_result = register_user(
+                    session,
+                    email,
+                    registration_password,
+                    password_header,
+                    password_so_header,
+                )
+                authorize_sentinel_header = password_header
+                authorize_so_header = password_so_header
+                otp_after_ts = time.time()
+                navigate_email_otp_send(
+                    session,
+                    register_result.get("continue_url") if isinstance(register_result, dict) else None,
+                    sentinel_header=password_header,
+                    so_header=password_so_header,
+                )
+            elif auth_page_type in ("email_otp_verification", "email-verification"):
+                logger.info(
+                    "[Auth] 当前邮箱验证模式=%s，沿用服务端已创建的 OTP 状态等待收件",
+                    auth_email_verification_mode or "unknown",
+                )
+            elif (
+                auth_page_type not in ("email_otp_verification", "email-verification", "external_url", "")
+                and "/email-verification" not in auth_continue_text
+            ):
+                raise RuntimeError(
+                    f"authorize/continue 返回未处理的页面类型: "
+                    f"page_type={auth_page_type}, continue_url={auth_continue_text[:220]}"
+                )
+
+        logger.info(
+            "[步骤4] Auth 会话完成，最终URL=%s，首次 Sentinel=%s",
+            final_authorize_url,
+            "已携带" if authorize_sentinel_header else "未启用",
+        )
         human_delay("navigate")
 
         # ==================== 阶段3: 验证码验证 ====================
-        # Sentinel Token 不提前生成；等 OTP 到手后紧贴 validate 请求生成，
-        # 避免等待邮箱期间 challenge 过期或与重新发送后的状态不一致。
+        # 发码用的 authorize_continue token 已在上一步完成；validate 使用
+        # 独立的新 challenge，避免等待邮箱期间复用已消费的 challenge。
 
         # 等待验证码：USE_EMAIL_SERVICE=True 时自动从 Outlook 取件，否则人工输入。
         # 如果验证码错误/过期，自动重新发送并重新取最新验证码。
@@ -329,8 +510,8 @@ def run_registration(
 
             human_delay("otp_input")
             try:
-                # HAR 对齐：2026-07-19 抓包中的 email-otp/validate 未携带 Sentinel。
-                # 保留开关，必要时可切回旧逻辑。
+                # HAR 对齐：email-otp/validate 的 Sentinel 由开关控制；
+                # 首次发码阶段始终优先使用 authorize_continue 的真实 SDK token。
                 sentinel_header_9 = None
                 so_header_9 = None
                 if getattr(_protocol_cfg, "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE", False):
@@ -346,7 +527,20 @@ def run_registration(
                     raise
                 logger.warning(f"[OTP] 验证码错误/过期：{str(exc)[:180]}，准备重新发送并重新获取验证码")
                 otp_after_ts = time.time()
-                send_email_otp(session)
+                retry_sentinel_header = authorize_sentinel_header
+                retry_so_header = authorize_so_header
+                if getattr(_protocol_cfg, "SEND_SENTINEL_BEFORE_AUTHORIZE", True):
+                    retry_sentinel_header, retry_so_header = prepare_authorize_sentinel(
+                        session,
+                        refresh=True,
+                    )
+                    authorize_sentinel_header = retry_sentinel_header
+                    authorize_so_header = retry_so_header
+                send_email_otp(
+                    session,
+                    sentinel_header=retry_sentinel_header,
+                    so_header=retry_so_header,
+                )
                 human_delay("api")
                 current_otp = None
 
@@ -508,6 +702,7 @@ def run_registration(
                 "user": session_info.get("user"),
                 "account": session_info.get("account"),
                 "expires": session_info.get("expires"),
+                "registration_password": registration_password,
                 "device_id": session.device_id,
                 "sentinel_sid": getattr(session, "sentinel_sid", None),
                 "browser_profile": getattr(session, "browser_profile", None),

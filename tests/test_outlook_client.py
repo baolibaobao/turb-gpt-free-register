@@ -101,6 +101,76 @@ class OutlookClientContextTests(unittest.TestCase):
         get_outlook_by_email.assert_called_once_with("pool@outlook.test")
         get_account_by_email.assert_called_once_with("pool@outlook.test")
 
+    def test_container_imap_error_disables_remote_fetch(self):
+        error = '{"code":"IMAP_REQUIRES_CONTAINER","error":"IMAP TCP/TLS is unavailable"}'
+
+        self.assertTrue(outlook_client._is_remote_disabled_error(error))
+
+    @patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_MODE", "direct")
+    def test_direct_mode_only_fetches_graph(self):
+        self.assertEqual(outlook_client._fetch_protocols(), ("graph",))
+
+    @patch("core.db.update_outlook_credentials", return_value={"pool": True, "accounts": 1, "changed": True})
+    def test_rotated_refresh_token_is_persisted_and_replaces_context(self, update_credentials):
+        account = outlook_client.OutlookAccount(
+            email="rotate@outlook.test",
+            password="password",
+            client_id="client-id",
+            refresh_token="old-refresh-token",
+        )
+        old_key = outlook_client._ms_token_cache_key(account)
+        outlook_client._MS_TOKEN_CACHE[old_key] = ("graph:old-access", 9999999999)
+
+        self.assertTrue(outlook_client._persist_rotated_refresh_token(account, "new-refresh-token"))
+        self.assertEqual(account.refresh_token, "new-refresh-token")
+        self.assertNotIn(old_key, outlook_client._MS_TOKEN_CACHE)
+        update_credentials.assert_called_once_with(
+            "rotate@outlook.test", refresh_token="new-refresh-token"
+        )
+
+    @patch.object(outlook_client, "_ms_http")
+    @patch.object(outlook_client, "_ms_access_token", return_value=("graph-token", "graph"))
+    @patch.object(outlook_client, "_fetch_graph_messages")
+    def test_graph_direct_scans_configured_folders(self, fetch_messages, access_token, ms_http):
+        class _Http:
+            def close(self):
+                pass
+
+        ms_http.return_value = _Http()
+        fetch_messages.side_effect = lambda _http, _token, folder="inbox": [{"folder": folder}]
+        account = outlook_client.OutlookAccount("scan@outlook.test", "password", "client", "refresh")
+
+        rows = outlook_client._fetch_via_graph_direct(account)
+
+        self.assertEqual([row["folder"] for row in rows], ["inbox", "junkemail", "deleteditems"])
+        self.assertEqual(fetch_messages.call_count, 3)
+
+    @patch.object(outlook_client, "_ms_http")
+    @patch.object(outlook_client, "_ms_access_token", return_value=("access-token", "graph"))
+    @patch.object(outlook_client, "get_account_context")
+    def test_manual_refresh_uses_current_credentials_without_exposing_tokens(
+        self, get_account_context, access_token, ms_http
+    ):
+        class _Http:
+            def close(self):
+                pass
+
+        account = outlook_client.OutlookAccount(
+            "manual@outlook.test", "password", "client", "refresh"
+        )
+        get_account_context.return_value = account
+        ms_http.return_value = _Http()
+
+        result = outlook_client.refresh_account_token(account.email)
+
+        self.assertEqual(result, {
+            "email": "manual@outlook.test",
+            "kind": "graph",
+            "rotated": False,
+            "access_token_obtained": True,
+        })
+        access_token.assert_called_once_with(account, http=ms_http.return_value)
+
 
 if __name__ == "__main__":
     unittest.main()

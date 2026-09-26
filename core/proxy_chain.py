@@ -351,6 +351,9 @@ def open_proxy_pool_proxy(
         proxy_cfg.pick_proxy() if selected_proxy is None else selected_proxy
         or ""
     ).strip()
+    from core.mihomo_proxy import is_managed_proxy
+    if is_managed_proxy(target):
+        return target, None
     upstream = str(getattr(proxy_cfg, "PROXY_POOL_UPSTREAM_PROXY", "") or "").strip()
     if not target or not upstream:
         return target, None

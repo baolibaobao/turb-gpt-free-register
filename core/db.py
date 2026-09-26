@@ -557,6 +557,22 @@ def _outlook_line(row: dict) -> str:
     ])
 
 
+def _outlook_material_line(row: dict) -> str:
+    """更新 Outlook 凭据时保留可选的恢复邮箱/恢复码字段。"""
+    original = str(row.get("original_email_line") or "").strip()
+    parts = original.split("----") if original else []
+    values = [
+        str(row.get("email") or ""),
+        str(row.get("password") or ""),
+        str(row.get("client_id") or ""),
+        str(row.get("refresh_token") or ""),
+    ]
+    if len(parts) >= 4:
+        parts[:4] = values
+        return "----".join(parts)
+    return _outlook_line(row)
+
+
 def _generic_api_email_line(row: dict) -> str:
     return "----".join([
         row.get("email") or "",
@@ -2246,6 +2262,138 @@ def import_outlook_accounts(records: list[dict]) -> tuple[int, int]:
         return inserted, skipped
 
 
+def upsert_outlook_accounts(records: list[dict]) -> tuple[int, int, int]:
+    """导入 Outlook 凭据，并显式更新已存在的同邮箱记录。
+
+    返回 ``(inserted, updated, skipped)``。只有调用方明确选择更新模式时才使用，
+    避免普通重复导入意外用旧素材覆盖已经轮换过的新 refresh_token。
+    """
+    with _LOCK:
+        rows = _load_outlook()
+        inserted = updated = skipped = 0
+        changed_records: list[dict] = []
+        for raw in records:
+            email = (raw.get("email") or "").strip()
+            if not email:
+                skipped += 1
+                continue
+            existing = _find_by_email(rows, email)
+            values = {
+                "password": (raw.get("password") or "").strip(),
+                "client_id": (raw.get("client_id") or raw.get("clientId") or "").strip(),
+                "refresh_token": (raw.get("refresh_token") or raw.get("refreshToken") or "").strip(),
+            }
+            if existing is not None:
+                row_changed = False
+                for key, value in values.items():
+                    if value and value != str(existing.get(key) or "").strip():
+                        existing[key] = value
+                        row_changed = True
+                if row_changed:
+                    existing["copy_line"] = _outlook_line(existing)
+                    updated += 1
+                    changed_records.append({"email": email, **values})
+                else:
+                    skipped += 1
+                continue
+
+            if not all(values.values()):
+                skipped += 1
+                continue
+            row = {
+                "id": _next_id(rows),
+                "email": email,
+                **values,
+                "status": "available",
+                "used_at": None,
+                "note": None,
+                "imported_at": _now(),
+            }
+            row["copy_line"] = _outlook_line(row)
+            rows.append(row)
+            inserted += 1
+
+        if inserted or updated:
+            _save_outlook(rows)
+
+        # 同邮箱如果已经注册成功，也同步更新账号表中的 Outlook 素材，
+        # 这样重启后 get_account_context 不会回退到旧 refresh_token。
+        for item in changed_records:
+            update_outlook_credentials(
+                item["email"],
+                password=item.get("password"),
+                client_id=item.get("client_id"),
+                refresh_token=item.get("refresh_token"),
+            )
+        return inserted, updated, skipped
+
+
+def update_outlook_credentials(
+    email: str,
+    *,
+    password: str | None = None,
+    client_id: str | None = None,
+    refresh_token: str | None = None,
+) -> dict:
+    """持久化 Outlook 凭据轮换结果到邮箱池和已注册账号。"""
+    target = str(email or "").strip()
+    if not target:
+        return {"pool": False, "accounts": 0, "changed": False}
+    values = {
+        key: str(value).strip()
+        for key, value in (
+            ("password", password),
+            ("client_id", client_id),
+            ("refresh_token", refresh_token),
+        )
+        if value is not None and str(value).strip()
+    }
+    if not values:
+        return {"pool": False, "accounts": 0, "changed": False}
+
+    with _LOCK:
+        pool_rows = _load_outlook()
+        accounts = _load_accounts()
+        pool_row = _find_by_email(pool_rows, target)
+        pool_changed = False
+        account_count = 0
+
+        if pool_row is not None:
+            for key, value in values.items():
+                if value != str(pool_row.get(key) or "").strip():
+                    pool_row[key] = value
+                    pool_changed = True
+            if pool_changed:
+                pool_row["copy_line"] = _outlook_line(pool_row)
+
+        for row in accounts:
+            if (row.get("email") or "").strip().lower() != target.lower():
+                continue
+            source = str(row.get("email_source") or "").strip().lower()
+            if source and source != "outlook":
+                continue
+            row_changed = False
+            for key, value in values.items():
+                if value != str(row.get(key) or "").strip():
+                    row[key] = value
+                    row_changed = True
+            if row_changed:
+                row["original_email_line"] = _outlook_material_line(row)
+                row["copy_line"] = _account_line(row)
+                row["updated_at"] = _now()
+                account_count += 1
+
+        if pool_changed:
+            _save_outlook(pool_rows)
+        if account_count:
+            _save_accounts(accounts)
+        return {
+            "pool": pool_changed,
+            "accounts": account_count,
+            "changed": bool(pool_changed or account_count),
+        }
+
+
 def import_registered_email_accounts(records: list[dict], source: str | None) -> tuple[int, int]:
     """
     把邮箱素材直接导入为“已注册成功账号”，用于跳过注册、直接在账号页补跑 Codex 授权。
@@ -3138,6 +3286,19 @@ def job_status_counts() -> dict:
         }
     counts["active"] = sum(int(counts.get(status, 0) or 0) for status in ("pending", "running", "stopping"))
     return counts
+
+
+def has_active_proxy_work() -> bool:
+    """Check pending/running network work without loading account credentials."""
+    if job_status_counts().get("active", 0):
+        return True
+    paths = [f"$.{name}" for name in (
+        "plan_check_status", "live_check_status", "codex_agent_status", "codex_status",
+        "extract_link_status", "totp_setup_status", "email_change_status",
+    )]
+    where = " OR ".join("json_extract(payload, ?) IN ('queued','pending','running','stopping')" for _ in paths)
+    with closing(_sqlite_conn()) as conn:
+        return conn.execute(f"SELECT 1 FROM accounts WHERE {where} LIMIT 1", paths).fetchone() is not None
 
 
 def get_job(job_id: int) -> dict | None:

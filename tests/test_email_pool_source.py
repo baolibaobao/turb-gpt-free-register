@@ -114,6 +114,30 @@ class EmailPoolSourceTests(unittest.TestCase):
                 self.assertTrue(db.delete_email_pool("domain@example.com", source="cloudflare_domain"))
                 self.assertFalse(db.list_email_pool_page(source="all", limit=10)["items"])
 
+    def test_upsert_outlook_updates_existing_refresh_token(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.multiple(db, **self._storage_patches(root)):
+                db.import_outlook_accounts([{
+                    "email": "rotate@example.com",
+                    "password": "password",
+                    "client_id": "client-id",
+                    "refresh_token": "old-refresh",
+                }])
+
+                result = db.upsert_outlook_accounts([{
+                    "email": "rotate@example.com",
+                    "password": "password",
+                    "client_id": "client-id",
+                    "refresh_token": "new-refresh",
+                }])
+
+                self.assertEqual(result, (0, 1, 0))
+                self.assertEqual(
+                    db.get_outlook_by_email("rotate@example.com")["refresh_token"],
+                    "new-refresh",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

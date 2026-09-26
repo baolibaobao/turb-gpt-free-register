@@ -55,7 +55,7 @@ class _ProtocolSession:
         self.document_navigation_id = old + "-next"
         return self.document_navigation_id
 
-    def post(self, url, *, headers, data):
+    def post(self, url, *, headers, data, **_kwargs):
         self.posts.append((url, headers, data))
         if url.endswith("/sentinel/req"):
             return _Response(payload={"token": "challenge", "persona": "p"})
@@ -151,7 +151,7 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
     def test_bundled_sentinel_sdk_matches_captured_20260810913b_source(self):
         sdk_path = Path(__file__).resolve().parents[1] / "sentinel" / "sdk.js"
         self.assertEqual(
-            hashlib.sha256(sdk_path.read_bytes()).hexdigest(),
+            hashlib.sha256(sdk_path.read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
             "49d0284bf3eea8a59ebcad0e6b5dd8a53edd4c72606f15bbf51ebe5610a88efd",
         )
 
@@ -173,6 +173,41 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
         })
         self.assertEqual(result["continue_url"], "/api/accounts/email-otp/send")
 
+    def test_follow_authorize_forwards_prepared_sentinel_headers(self):
+        session = _ProtocolSession()
+
+        result = openai_auth.follow_authorize(
+            session,
+            "https://auth.openai.com/api/accounts/authorize?state=test",
+            sentinel_header="sentinel",
+            so_header="so-token",
+        )
+
+        self.assertEqual(result, "https://auth.openai.com/email-verification")
+        _url, headers, _redirects = session.gets[-1]
+        self.assertEqual(headers["openai-sentinel-token"], "sentinel")
+        self.assertEqual(headers["openai-sentinel-so-token"], "so-token")
+
+    def test_authorize_continue_forwards_both_sentinel_headers(self):
+        session = _ProtocolSession()
+
+        result = openai_auth.authorize_continue(
+            session,
+            "user@example.com",
+            "sentinel",
+            "so-token",
+        )
+
+        url, headers, body = session.posts[-1]
+        self.assertEqual(url, "https://auth.openai.com/api/accounts/authorize/continue")
+        self.assertEqual(headers["openai-sentinel-token"], "sentinel")
+        self.assertEqual(headers["openai-sentinel-so-token"], "so-token")
+        self.assertEqual(json.loads(body), {
+            "username": {"value": "user@example.com", "kind": "email"},
+            "screen_hint": "signup",
+        })
+        self.assertEqual(result["continue_url"], "/api/accounts/email-otp/send")
+
     def test_email_otp_send_accepts_relative_url_and_rotates_document_id(self):
         session = _ProtocolSession()
 
@@ -188,6 +223,19 @@ class OpenAIRegistrationFlowTests(unittest.TestCase):
         self.assertTrue(redirects)
         self.assertEqual(final_url, "https://auth.openai.com/email-verification")
         self.assertEqual(session.document_navigation_id, "document-1-next")
+
+    def test_email_otp_resend_forwards_sentinel_headers(self):
+        session = _ProtocolSession()
+
+        openai_auth.send_email_otp(
+            session,
+            sentinel_header="sentinel",
+            so_header="so-token",
+        )
+
+        _url, headers, _redirects = session.gets[-1]
+        self.assertEqual(headers["openai-sentinel-token"], "sentinel")
+        self.assertEqual(headers["openai-sentinel-so-token"], "so-token")
 
     def test_validate_email_otp_forwards_both_sentinel_headers(self):
         session = _ProtocolSession()

@@ -172,6 +172,22 @@ def _is_retryable_authorize_error(exc: Exception) -> bool:
     )
 
 
+def _exception_http_status(exc: Exception) -> int:
+    response = getattr(exc, "response", None)
+    try:
+        return int(getattr(response, "status_code", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_cloudflare_challenge(exc: Exception) -> bool:
+    """识别目标站点明确下发的 Cloudflare challenge，避免无效重复请求。"""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    status = _exception_http_status(exc)
+    return status == 403 and str(headers.get("cf-mitigated", "") or "").strip().lower() == "challenge"
+
+
 def _reset_retryable_circuit(session: BrowserSession) -> None:
     """仅清除本地熔断，保留当前 Session 的 Cookie Jar 和完整身份上下文。"""
     reset = getattr(session, "reset_circuit_breaker", None)
@@ -213,14 +229,31 @@ def _request_with_proxy_retry(session: BrowserSession, label: str, fn):
             return response
         except Exception as exc:
             last_exc = exc
+            if _is_cloudflare_challenge(exc):
+                logger.error(
+                    "[%s] ChatGPT 登录页返回 Cloudflare challenge (HTTP 403)，"
+                    "代理已连通，当前节点/协议会话未通过挑战；停止重复请求",
+                    label,
+                )
+                raise RuntimeError(
+                    "ChatGPT 登录页返回 Cloudflare challenge (HTTP 403)；"
+                    "代理已连通，请更换非云/机房出口或使用可完成网页挑战的正常浏览器流程"
+                ) from exc
             if not _is_retryable_authorize_error(exc) or attempt >= max_attempts:
                 raise
             _reset_retryable_circuit(session)
             backoff = retry_delay * (2 ** (attempt - 1))
-            logger.warning(
-                "[%s] 代理链路临时失败 (%s/%s): %s: %s，保留当前会话，%.1fs 后重试",
-                label, attempt, max_attempts, type(exc).__name__, str(exc)[:180], backoff,
-            )
+            status = _exception_http_status(exc)
+            if status:
+                logger.warning(
+                    "[%s] 目标站点返回 HTTP %s (%s/%s)，保留当前会话，%.1fs 后重试",
+                    label, status, attempt, max_attempts, backoff,
+                )
+            else:
+                logger.warning(
+                    "[%s] 代理/TLS/网络临时失败 (%s/%s): %s: %s，保留当前会话，%.1fs 后重试",
+                    label, attempt, max_attempts, type(exc).__name__, str(exc)[:180], backoff,
+                )
             _interruptible_sleep(backoff)
     raise last_exc if last_exc else RuntimeError(f"{label} 重试耗尽但无异常记录")
 
@@ -252,7 +285,12 @@ def network_preflight(session: BrowserSession) -> None:
             observe(resp)
 
 
-def follow_authorize(session: BrowserSession, authorize_url: str) -> str:
+def follow_authorize(
+    session: BrowserSession,
+    authorize_url: str,
+    sentinel_header: str | None = None,
+    so_header: str | None = None,
+) -> str:
     """
     步骤4: 跟随 authorize URL 重定向。
     GET auth.openai.com/api/accounts/authorize?...
@@ -265,6 +303,13 @@ def follow_authorize(session: BrowserSession, authorize_url: str) -> str:
         authorize_url: 从步骤3获取的 authorize URL
     """
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
+    # Some Auth deployments trigger email OTP while processing the authorize
+    # navigation itself. Keep the real authorize_continue Sentinel result on
+    # that first request so the server does not silently drop the email.
+    if sentinel_header:
+        headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
 
     max_attempts, retry_delay = _proxy_retry_config()
     last_exc: Exception | None = None
@@ -306,6 +351,7 @@ def request_sentinel_token(session: BrowserSession, flow: str) -> dict:
     Args:
         session: 浏览器会话
         flow: 流程类型
+            - "authorize_continue": 首次提交邮箱并触发 OTP
             - "username_password_create": 步骤6
             - "email_otp_validate": 步骤9
             - "oauth_create_account": 步骤11
@@ -522,6 +568,88 @@ def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: st
     return header_value, so_header
 
 
+def prepare_authorize_sentinel(session: BrowserSession, refresh: bool = True) -> tuple[str, str | None]:
+    """Generate the real SDK token used by the first email/authorize step.
+
+    The registration flow must solve ``authorize_continue`` before the server
+    decides whether to send an OTP. Keeping the pair on the session also lets
+    a later resend reuse the exact headers without passing secrets through
+    unrelated call sites.
+    """
+    cached = (
+        getattr(session, "_authorize_sentinel_header", None),
+        getattr(session, "_authorize_sentinel_so_header", None),
+    )
+    if not refresh and cached[0]:
+        return cached
+
+    sentinel_resp = request_sentinel_token(session, "authorize_continue")
+    sentinel_header, so_header = build_sentinel_header(
+        session,
+        sentinel_resp,
+        "authorize_continue",
+    )
+    setattr(session, "_authorize_sentinel_header", sentinel_header)
+    setattr(session, "_authorize_sentinel_so_header", so_header)
+    logger.info(
+        "[Sentinel] authorize_continue 真实 SDK token 已准备，将用于首次 OTP 触发"
+    )
+    return sentinel_header, so_header
+
+
+def authorize_continue(
+    session: BrowserSession,
+    email: str,
+    sentinel_header: str,
+    so_header: str | None = None,
+    screen_hint: str = "signup",
+    referer: str = "https://auth.openai.com/create-account",
+) -> dict:
+    """Submit the email to Auth with a real ``authorize_continue`` token.
+
+    This is the explicit path used by newer Auth pages. It is kept separate
+    from the automatic authorize redirect because the latter may trigger OTP
+    before a token is available.
+    """
+    url = "https://auth.openai.com/api/accounts/authorize/continue"
+    headers = session.get_auth_headers(referer=referer)
+    if sentinel_header:
+        headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
+    body = json.dumps(
+        {
+            "username": {"value": email, "kind": "email"},
+            "screen_hint": screen_hint,
+        },
+        separators=(",", ":"),
+    )
+    logger.info("[Auth] 显式提交邮箱并触发 OTP 判定：%s", email)
+    resp = session.post(url, headers=headers, data=body, allow_redirects=False)
+    if resp.status_code not in (200, 204):
+        logger.error(
+            "[Auth] authorize/continue 失败 status=%s body=%s",
+            resp.status_code,
+            (resp.text or "")[:360],
+        )
+        resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    page = data.get("page") if isinstance(data.get("page"), dict) else {}
+    logger.info(
+        "[Auth] authorize/continue 完成 page=%s mode=%s continue=%s",
+        page.get("type") or "-",
+        str((page.get("payload") or {}).get("email_verification_mode") or "-")
+        if isinstance(page.get("payload"), dict) else "-",
+        str(data.get("continue_url") or "")[:160] or "-",
+    )
+    return data
+
+
 def generate_registration_password(length: int = 14) -> str:
     """生成与 Roxy 注册一致的强密码；配置 REGISTER_PASSWORD 时优先使用。"""
     try:
@@ -545,6 +673,34 @@ def generate_registration_password(length: int = 14) -> str:
     return "".join(chars)
 
 
+def open_create_account_password(session: BrowserSession) -> str:
+    """建立密码注册页状态后再提交 ``user/register``。
+
+    Auth 在 ``passwordless_signup`` 下先返回邮箱验证页，但真实网页会
+    继续导航到密码页；这个 document 状态决定后续 ``user/register`` 和
+    ``email-otp/send`` 是否进入真正的注册发码流程。
+    """
+    url = "https://auth.openai.com/create-account/password"
+    headers = session.get_auth_navigate_headers(
+        referer="https://auth.openai.com/create-account"
+    )
+    headers["sec-fetch-site"] = "same-origin"
+    logger.info("[Auth] 建立 create-account/password 页面状态")
+    resp = session.get(url, headers=headers, allow_redirects=True)
+    final_url = str(getattr(resp, "url", "") or url)
+    logger.info(
+        "[Auth] create-account/password 响应 status=%s final_url=%s",
+        resp.status_code,
+        final_url[:220],
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"create-account/password 导航失败 status={resp.status_code}: "
+            f"{(resp.text or '')[:260]}"
+        )
+    return final_url
+
+
 def register_user(
     session: BrowserSession,
     email: str,
@@ -565,10 +721,21 @@ def register_user(
         logger.error("[步骤7] user/register 失败 status=%s body=%s", resp.status_code, (resp.text or "")[:500])
         resp.raise_for_status()
     data = resp.json()
+    page = data.get("page") if isinstance(data, dict) and isinstance(data.get("page"), dict) else {}
+    logger.info(
+        "[步骤7] user/register 成功 page=%s continue=%s",
+        page.get("type") or "-",
+        str(data.get("continue_url") or "")[:220] if isinstance(data, dict) else "-",
+    )
     return data
 
 
-def navigate_email_otp_send(session: BrowserSession, continue_url: str | None = None) -> str:
+def navigate_email_otp_send(
+    session: BrowserSession,
+    continue_url: str | None = None,
+    sentinel_header: str | None = None,
+    so_header: str | None = None,
+) -> str:
     """跟随 user/register 返回地址发送 OTP，并建立新的验证页 document 状态。"""
     url = str(continue_url or "https://auth.openai.com/api/accounts/email-otp/send")
     if url.startswith("/"):
@@ -576,7 +743,20 @@ def navigate_email_otp_send(session: BrowserSession, continue_url: str | None = 
     headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/create-account/password")
     headers["sec-fetch-site"] = "same-origin"
     headers["sec-fetch-user"] = "?1"
+    if sentinel_header:
+        headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
+    logger.info("[OTP] 显式触发邮箱验证码: GET %s", url)
     resp = session.get(url, headers=headers, allow_redirects=True)
+    response_headers = getattr(resp, "headers", {}) or {}
+    logger.info(
+        "[OTP] email-otp/send 响应 status=%s final_url=%s content_type=%s request_id=%s",
+        resp.status_code,
+        str(getattr(resp, "url", "") or "")[:220],
+        str(response_headers.get("content-type") or "")[:100],
+        str(response_headers.get("x-request-id") or "")[:100],
+    )
     resp.raise_for_status()
     _rotate_document_navigation_id(session)
     final_url = str(getattr(resp, "url", "") or "")
@@ -669,12 +849,21 @@ def navigate_about_you(session: BrowserSession, about_url: str | None = None) ->
     return final_url
 
 
-def send_email_otp(session: BrowserSession, referer: str = "https://auth.openai.com/email-verification") -> None:
+def send_email_otp(
+    session: BrowserSession,
+    referer: str = "https://auth.openai.com/email-verification",
+    sentinel_header: str | None = None,
+    so_header: str | None = None,
+) -> None:
     """重新发送邮箱验证码。用于验证码错误/过期后重新取码。"""
     url = "https://auth.openai.com/api/accounts/email-otp/send"
     headers = session.get_auth_navigate_headers(referer=referer)
     headers["sec-fetch-site"] = "same-origin"
     headers["sec-fetch-user"] = "?1"
+    if sentinel_header:
+        headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
     logger.info("[OTP] 请求重新发送邮箱验证码...")
     resp = session.get(url, headers=headers, allow_redirects=True)
     if resp.status_code >= 400:

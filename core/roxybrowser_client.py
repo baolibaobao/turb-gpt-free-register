@@ -464,7 +464,11 @@ class RoxyBrowserClient:
         project_id = _project_id_value()
         if project_id:
             body.setdefault("projectId", project_id)
-        if bool(getattr(_cfg, "ROXY_CREATE_USE_PROXY_POOL", False)) and not body.get("proxyInfo"):
+        from core.mihomo_proxy import managed_enabled
+        managed = managed_enabled()
+        if managed and urlparse(str(_cfg.ROXY_API_BASE)).hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise RuntimeError("项目代理只监听本机；请使用本机 Roxy API，或停用项目代理后配置远程浏览器网络")
+        if managed or (bool(getattr(_cfg, "ROXY_CREATE_USE_PROXY_POOL", False)) and not body.get("proxyInfo")):
             from config import proxy as _proxy_cfg
             from core.proxy_chain import open_proxy_pool_proxy
 
@@ -521,6 +525,9 @@ class RoxyBrowserClient:
     def open_profile(self, profile_id: str | None = None) -> RoxyOpenResult:
         one_profile = bool(getattr(_cfg, "ROXY_ONE_PROFILE_PER_ACCOUNT", True))
         configured_pid = self._normalize_profile_id(profile_id if profile_id is not None else getattr(_cfg, "ROXY_PROFILE_ID", ""))
+        from core.mihomo_proxy import managed_enabled
+        if configured_pid and managed_enabled():
+            raise RuntimeError("项目代理启用时请将 ROXY_PROFILE_ID 留空，以便新建环境应用选定节点")
         if one_profile and configured_pid:
             raise RuntimeError(
                 "已启用 ROXY_ONE_PROFILE_PER_ACCOUNT=True（一号一环境），"

@@ -16,8 +16,8 @@ Outlook 邮箱客户端（mail.chatai.codes 双协议）
     2. fetch_latest_otp()   双协议（Graph / IMAP）轮询取 OTP
     3. 注册成功后会写入 SQLite 账号表
 
-只用 Outlook 提供的 refresh_token 调远端的 mail.chatai.codes 服务，
-不直连 Microsoft Graph，因为后者要 access_token + 复杂 OAuth 协议。
+优先使用本地 Microsoft Graph 直连取件，远端 mail.chatai.codes 作为兼容回退。
+Graph 返回的 refresh_token 若发生轮换，会自动写回本地邮箱池和已注册账号。
 """
 import base64
 import email as email_lib
@@ -345,6 +345,37 @@ def release_account(email: str, status: str = "available", note: str | None = No
     _CONTEXT_CACHE.pop(_cache_key(email), None)
 
 
+def invalidate_account_context(email: str) -> None:
+    """让手动更新凭据后下一次取件重新从数据库读取。"""
+    _CONTEXT_CACHE.pop(_cache_key(email), None)
+
+
+def refresh_account_token(email: str) -> dict:
+    """主动用当前 Outlook refresh_token 换取 access_token。
+
+    Microsoft 若在响应中轮换 refresh_token，``_ms_access_token`` 会立即持久化新值；
+    返回值只包含状态和 token 类型，不返回任何 token 内容。
+    """
+    account = get_account_context(email)
+    if account is None:
+        raise OutlookClientError(f"未找到 {email} 的 Outlook 凭据")
+
+    old_refresh = str(account.refresh_token or "").strip()
+    _clear_ms_token_cache(account)
+    http = _ms_http()
+    try:
+        token, kind = _ms_access_token(account, http=http)
+        new_refresh = str(account.refresh_token or "").strip()
+        return {
+            "email": account.email,
+            "kind": kind,
+            "rotated": bool(new_refresh and new_refresh != old_refresh),
+            "access_token_obtained": bool(token),
+        }
+    finally:
+        http.close()
+
+
 def import_outlook_from_file(path: str | Path | None = None) -> tuple[int, int]:
     """读取一份账号文本文件，全量导入 DB，返回 (新增, 已存在跳过)。"""
     from core.db import import_outlook_accounts
@@ -379,7 +410,7 @@ def import_outlook_from_text(text: str) -> tuple[int, int]:
 
 
 # ============================================================
-# 抓取邮件：Graph 失败回退 IMAP
+# 抓取邮件：Graph 失败回退 IMAP；Graph 直连模式只访问 Microsoft Graph
 # ============================================================
 
 
@@ -388,8 +419,76 @@ def _outlook_fetch_mode() -> str:
 
 
 def _is_remote_disabled_error(exc: Exception | str) -> bool:
-    text = str(exc or "")
-    return "DEPLOYMENT_DISABLED" in text or "HTTP 402" in text or "Payment required" in text
+    text = str(exc or "").upper()
+    return (
+        "DEPLOYMENT_DISABLED" in text
+        or "HTTP 402" in text
+        or "PAYMENT REQUIRED" in text
+        or "IMAP_REQUIRES_CONTAINER" in text
+    )
+
+
+def _graph_folders() -> tuple[str, ...]:
+    """读取 Graph 文件夹配置，默认覆盖收件箱和垃圾邮件。"""
+    raw = getattr(_email_cfg, "OUTLOOK_GRAPH_FOLDERS", ("inbox", "junkemail", "deleteditems"))
+    if isinstance(raw, str):
+        values = [line.strip() for line in raw.splitlines() if line.strip()]
+    else:
+        values = [str(item).strip() for item in (raw or []) if str(item).strip()]
+    allowed = {"inbox", "junkemail", "deleteditems", "drafts", "sentitems", "archive"}
+    result = tuple(dict.fromkeys(value.lower() for value in values if value.lower() in allowed))
+    return result or ("inbox", "junkemail", "deleteditems")
+
+
+def _fetch_protocols() -> tuple[str, ...]:
+    """返回当前取件模式需要访问的协议，避免在 Graph 直连时触发 IMAP。"""
+    mode = _outlook_fetch_mode()
+    if mode in ("direct", "graph", "graph_direct", "msgraph"):
+        return ("graph",)
+    if mode == "auto" and _REMOTE_DISABLED:
+        return ("graph",)
+    return ("graph", "imap")
+
+
+def _clear_ms_token_cache(account: OutlookAccount) -> None:
+    """清除某个邮箱的 Graph/IMAP access token 缓存。"""
+    prefix = f"{account.email}|{account.client_id}|"
+    for cache in (_MS_TOKEN_CACHE, _MS_TOKEN_FATAL_CACHE):
+        for key in list(cache):
+            if key.startswith(prefix):
+                cache.pop(key, None)
+
+
+def _persist_rotated_refresh_token(account: OutlookAccount, refresh_token: str) -> bool:
+    """保存 Microsoft OAuth 返回的轮换 refresh_token，不记录 token 内容。"""
+    if not bool(getattr(_email_cfg, "OUTLOOK_TOKEN_AUTO_ROTATE", True)):
+        return False
+    new_token = str(refresh_token or "").strip()
+    old_token = str(account.refresh_token or "").strip()
+    if not new_token or new_token == old_token:
+        return False
+
+    account.refresh_token = new_token
+    _clear_ms_token_cache(account)
+    try:
+        from core.db import update_outlook_credentials
+
+        result = update_outlook_credentials(account.email, refresh_token=new_token)
+        logger.info(
+            "[Outlook] Microsoft 返回了新的 refresh_token，已更新本地凭据：email=%s pool=%s accounts=%s",
+            account.email,
+            bool(result.get("pool")),
+            int(result.get("accounts") or 0),
+        )
+        return bool(result.get("changed"))
+    except Exception as exc:
+        # 当前会话仍使用新值，重启后的持久化问题单独记录出来。
+        logger.warning(
+            "[Outlook] 新 refresh_token 已用于当前会话，但写回本地失败：%s: %s",
+            type(exc).__name__,
+            str(exc)[:180],
+        )
+        return False
 
 
 def _ms_http() -> CurlSession:
@@ -557,6 +656,26 @@ def _ms_access_token(
         attempts = [
             (
                 "graph",
+                "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
+                {
+                    "client_id": account.client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": account.refresh_token,
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+            ),
+            (
+                "graph",
+                "https://login.live.com/oauth20_token.srf",
+                {
+                    "client_id": account.client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": account.refresh_token,
+                    "scope": "https://graph.microsoft.com/.default",
+                },
+            ),
+            (
+                "graph",
                 "https://login.microsoftonline.com/common/oauth2/v2.0/token",
                 {
                     "client_id": account.client_id,
@@ -599,6 +718,7 @@ def _ms_access_token(
         if preferred_kind:
             attempts = [item for item in attempts if item[0] == preferred_kind]
         last_text = ""
+        error_texts: list[str] = []
         for kind, url, payload in attempts:
             resp = http.post(
                 url,
@@ -615,13 +735,19 @@ def _ms_access_token(
             if resp.status_code == 200 and isinstance(data, dict) and data.get("access_token"):
                 expires_in = int(data.get("expires_in") or 3600)
                 token = str(data["access_token"])
+                rotated_refresh = str(data.get("refresh_token") or "").strip()
+                if rotated_refresh:
+                    _persist_rotated_refresh_token(account, rotated_refresh)
+                    cache_key = _ms_token_cache_key(account)
                 # Microsoft Graph 对个人 Outlook/MSA 账号可能返回 opaque access_token，
                 # 不一定是 JWT；Graph 仍然接受。不能用是否包含 "." 判断是否可用。
                 _MS_TOKEN_CACHE[cache_key] = (f"{kind}:{token}", now + max(300, expires_in - 60))
                 logger.debug("[Outlook] Microsoft token 获取成功 kind=%s jwt=%s", kind, _token_looks_jwt(token))
                 return token, kind
-        if _is_oauth_fatal_error(last_text):
-            reason = _compact_oauth_error(last_text)
+            error_texts.append(f"{url}: {text[:500]}")
+        all_errors = "\n".join(error_texts) or last_text
+        if _is_oauth_fatal_error(all_errors):
+            reason = _compact_oauth_error(all_errors)
             _MS_TOKEN_FATAL_CACHE[cache_key] = (reason, time.time() + 600)
             raise OutlookClientError(f"Microsoft OAuth refresh_token 换 token 失败: {reason}")
         raise OutlookClientError(f"Microsoft OAuth refresh_token 换 token 失败: {last_text}")
@@ -666,6 +792,10 @@ def _live_imap_access_token(account: OutlookAccount, http: CurlSession | None = 
         token = str((data or {}).get("access_token") or "")
         if resp.status_code == 200 and token:
             expires_in = int((data or {}).get("expires_in") or 3600)
+            rotated_refresh = str((data or {}).get("refresh_token") or "").strip()
+            if rotated_refresh:
+                _persist_rotated_refresh_token(account, rotated_refresh)
+                cache_key = _ms_token_cache_key(account) + "|live_imap"
             _MS_TOKEN_CACHE[cache_key] = (f"live_imap:{token}", now + max(300, expires_in - 60))
             scope = str((data or {}).get("scope") or "")
             logger.debug("[Outlook] Live IMAP(New) token 获取成功 scope=%s", scope[:160])
@@ -693,21 +823,23 @@ def _normalize_ms_message(m: dict) -> dict:
         "content": content or "",
         "body": content or "",
         "html": content or "",
+        "toRecipients": m.get("toRecipients") or [],
     }
 
 
-def _fetch_graph_messages(http: CurlSession, token: str) -> list[dict]:
+def _fetch_graph_messages(http: CurlSession, token: str, folder: str = "inbox") -> list[dict]:
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
         "Prefer": 'outlook.body-content-type="html"',
     }
-    url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+    folder_id = str(folder or "inbox").strip().lower() or "inbox"
+    url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder_id}/messages"
     params = {
         "$top": "20",
         "$orderby": "receivedDateTime desc",
-        "$select": "id,subject,from,receivedDateTime,bodyPreview,body",
+        "$select": "id,subject,from,toRecipients,receivedDateTime,bodyPreview,body",
     }
     resp = http.get(url, headers=headers, params=params)
     text = resp.text or ""
@@ -719,7 +851,8 @@ def _fetch_graph_messages(http: CurlSession, token: str) -> list[dict]:
         raise OutlookClientError(f"Microsoft Graph 响应缺少 value: {str(data)[:300]}")
     out = [_normalize_ms_message(m) for m in rows if isinstance(m, dict)]
     for item in out:
-        item["_fetch_source"] = "graph"
+        item["_fetch_source"] = f"graph:{folder_id}"
+        item["folder"] = folder_id
     return out
 
 
@@ -851,7 +984,7 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
 
 
 def _fetch_via_graph_direct(account: OutlookAccount) -> list[dict]:
-    """直连 Microsoft API 读取 Inbox 最新邮件；Graph 不兼容时自动 Outlook REST。"""
+    """直连 Microsoft Graph 扫描多个文件夹；全部失败时再回退 Outlook REST。"""
     fatal_reason = _ms_token_fatal_reason(account)
     if fatal_reason:
         logger.debug("[Outlook] 跳过 Graph/REST：OAuth 已知不可用：%s", fatal_reason)
@@ -860,17 +993,54 @@ def _fetch_via_graph_direct(account: OutlookAccount) -> list[dict]:
     try:
         token, kind = _ms_access_token(account, http=http)
         if kind == "graph":
-            try:
-                out = _fetch_graph_messages(http, token)
-                logger.debug(f"[Outlook] Microsoft Graph 直连拿到 {len(out)} 封邮件")
+            out: list[dict] = []
+            successful_folders = 0
+            refreshed_after_401 = False
+            for folder in _graph_folders():
+                try:
+                    rows = _fetch_graph_messages(http, token, folder=folder)
+                except OutlookClientError as exc:
+                    # access_token 失效时，用当前 account 上最新的 refresh_token 只重试一次。
+                    if "HTTP 401" in str(exc) and not refreshed_after_401:
+                        refreshed_after_401 = True
+                        _clear_ms_token_cache(account)
+                        try:
+                            token, kind = _ms_access_token(http=http, account=account, preferred_kind="graph")
+                            rows = _fetch_graph_messages(http, token, folder=folder)
+                        except Exception as retry_exc:
+                            logger.warning(
+                                "[Outlook] Graph 文件夹 %s 重试失败：%s: %s",
+                                folder, type(retry_exc).__name__, str(retry_exc)[:220],
+                            )
+                            continue
+                    else:
+                        logger.debug(
+                            "[Outlook] Graph 文件夹 %s 读取失败：%s: %s",
+                            folder, type(exc).__name__, str(exc)[:220],
+                        )
+                        continue
+                except Exception as exc:
+                    logger.debug(
+                        "[Outlook] Graph 文件夹 %s 请求异常：%s: %s",
+                        folder, type(exc).__name__, str(exc)[:220],
+                    )
+                    continue
+                successful_folders += 1
+                out.extend(rows)
+
+            if successful_folders:
+                logger.debug(
+                    "[Outlook] Microsoft Graph 直连扫描 %s，拿到 %s 封邮件",
+                    ",".join(_graph_folders()), len(out),
+                )
                 return out
-            except Exception as exc:
-                logger.warning(f"[Outlook] Microsoft Graph 读取失败，尝试 Outlook REST: {type(exc).__name__}: {exc}")
-                # 重新取 Outlook REST token。注意不能继续复用 Graph token；
-                # Graph token 的 audience 是 graph.microsoft.com，拿去请求
-                # outlook.office.com/api/v2.0 会返回 401。
-                _MS_TOKEN_CACHE.pop(f"{account.email}|{account.client_id}|{account.refresh_token[:24]}", None)
-                token, kind = _ms_access_token(account, http=http, preferred_kind="outlook")
+
+            logger.warning("[Outlook] Microsoft Graph 所有配置文件夹均不可读，尝试 Outlook REST")
+            # 重新取 Outlook REST token。注意不能继续复用 Graph token；
+            # Graph token 的 audience 是 graph.microsoft.com，拿去请求
+            # outlook.office.com/api/v2.0 会返回 401。
+            _clear_ms_token_cache(account)
+            token, kind = _ms_access_token(http=http, account=account, preferred_kind="outlook")
         out = _fetch_outlook_rest_messages(http, token)
         logger.debug(f"[Outlook] Outlook REST 直连拿到 {len(out)} 封邮件")
         return out
@@ -932,6 +1102,16 @@ def _fetch_via(session: CurlSession, protocol: str, account: OutlookAccount) -> 
     if not data.get("success"):
         logger.debug(f"[Outlook] {protocol} success=False: {data.get('error')}")
         return []
+
+    # 兼容远端取件服务在换 access_token 时返回轮换后的 refresh_token。
+    rotated_refresh = (
+        data.get("refreshToken")
+        or data.get("refresh_token")
+        or data.get("newRefreshToken")
+        or data.get("new_refresh_token")
+    )
+    if rotated_refresh:
+        _persist_rotated_refresh_token(account, str(rotated_refresh))
 
     emails = data.get("emails") or []
     source = f"remote_{protocol}"
@@ -1022,7 +1202,7 @@ def fetch_latest_otp(
     while time.time() < deadline:
         # 每轮都重新拉，因为可能有新邮件，也可能旧邮件因延迟才出现
         all_candidates: list[tuple[str, dict, float, str]] = []
-        for protocol in ("graph", "imap"):
+        for protocol in _fetch_protocols():
             emails = _fetch_via(session, protocol, account)
             for item in emails:
                 ts = _parse_email_ts(item) or 0.0

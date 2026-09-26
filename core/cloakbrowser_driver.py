@@ -405,7 +405,9 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     """
     proxy_relay = None
     proxy_pool_target = ""
-    if proxy is None and bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
+    from core.mihomo_proxy import managed_enabled
+    use_proxy = managed_enabled() or bool(getattr(_cfg, "CLOAK_USE_PROXY", True))
+    if proxy is None and use_proxy:
         try:
             from config.proxy import pick_proxy
         except Exception:
@@ -424,7 +426,7 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     if seed:
         launch_args.append(f"--fingerprint={seed}")
 
-    proxy_url = _normalize_proxy(proxy) if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)) else None
+    proxy_url = _normalize_proxy(proxy) if use_proxy else None
     locale_opts = _build_cloak_locale_options(proxy_url)
     # geoip=True 交给 CloakBrowser 根据当前出口 IP 自动匹配 timezone/locale/WebRTC。
     # 之前只有显式 proxy_url 时才开启；如果用户走系统代理/VPN/透明代理，代码层面

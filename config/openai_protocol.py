@@ -44,6 +44,12 @@ AB_SDK_VERSION = "3.32.7"
 # 2026-09-14 Roxy 成功样本中 email-otp/validate 同时携带 Sentinel 与 SO。
 SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE = True
 
+# 真实 SDK Sentinel 必须在首次 Auth 发码判定之前生成。保留两个开关：
+# - 首次 authorize 导航带 token，兼容当前自动落到 email-verification 的路径；
+# - 若导航没有直接触发 OTP，则显式 POST authorize/continue，使用同一 token。
+SEND_SENTINEL_BEFORE_AUTHORIZE = True
+USE_EXPLICIT_AUTHORIZE_CONTINUE = True
+
 # 是否补齐 HAR 中 ChatGPT Web 首屏 bootstrap 预热链路。
 CHATGPT_ANON_BOOTSTRAP_ENABLED = True
 CHATGPT_AUTH_BOOTSTRAP_ENABLED = True
@@ -63,4 +69,7 @@ apply_env_overrides(globals(), {
     "OPENAI_PROXY_RETRY_MAX_ATTEMPTS": "int",
     "OPENAI_PROXY_RETRY_DELAY": "float",
     "OPENAI_PREFLIGHT_TIMEOUT": "float",
+    "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE": "bool",
+    "SEND_SENTINEL_BEFORE_AUTHORIZE": "bool",
+    "USE_EXPLICIT_AUTHORIZE_CONTINUE": "bool",
 })

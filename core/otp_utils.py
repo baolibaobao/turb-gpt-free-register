@@ -10,19 +10,16 @@ OTP 检测与抽取通用工具，被 outlook_client（Outlook 邮箱）使用�
 import re
 
 _OPENAI_SENDER_HINT = "openai"
-
-# 多语言关键字（用于判断是否是 OpenAI 邮件）
-_OPENAI_KEYWORDS = (
-    "chatgpt", "openai",
-    # 英文
-    "verification code", "code is", "your code", "verify your email",
-    # 中文
-    "代码", "验证码", "确认码",
-    # 日文
-    "認証コード", "検証コード", "確認コード", "一時検証", "認証",
-    # 韩文
-    "인증 코드", "확인 코드",
+_OPENAI_SENDER_DOMAINS = (
+    "openai.com",
+    "chatgpt.com",
+    "tm.openai.com",
+    "auth.openai.com",
 )
+
+# 没有可靠发件人字段时，只接受正文明确出现品牌名；通用验证码文案不足以
+# 判定来源，否则 X 等服务的验证码可能被误提交为 OpenAI OTP。
+_OPENAI_BRAND_HINTS = ("chatgpt", "openai")
 
 # OTP 上下文关键字（用于在多个 6 位数中挑出真正的验证码）
 _OTP_CONTEXT_KEYWORDS = (
@@ -74,10 +71,15 @@ def looks_like_openai_email(item: dict) -> bool:
     text = _get_field(item, "text", "bodyPreview", "bodyText").lower()
     content = _get_field(item, "content", "body", "html", "body.content", "bodyHtml").lower()
 
-    if _OPENAI_SENDER_HINT in sender or _OPENAI_SENDER_HINT in sender_name:
+    if (
+        _OPENAI_SENDER_HINT in sender
+        or _OPENAI_SENDER_HINT in sender_name
+        or any(domain in sender for domain in _OPENAI_SENDER_DOMAINS)
+        or any(domain in sender_name for domain in _OPENAI_SENDER_DOMAINS)
+    ):
         return True
 
-    return any(k in s for s in (subject, text, content) for k in _OPENAI_KEYWORDS)
+    return any(k in s for s in (subject, text, content) for k in _OPENAI_BRAND_HINTS)
 
 
 def extract_otp(item: dict) -> str | None:

@@ -116,6 +116,15 @@ def resolve_plan_check_route(explicit_proxy: Optional[str] = None) -> dict:
 
     from config import proxy as proxy_cfg
 
+    from core.mihomo_proxy import managed_proxy_url
+    managed = managed_proxy_url()
+    if managed:
+        return {
+            "proxy": managed, "proxy_mode": "managed", "network_route": "proxy",
+            "proxy_used": managed, "upstream_proxy": "", "upstream_proxy_used": None,
+            "proxy_fallback_reason": None,
+        }
+
     mode = str(getattr(proxy_cfg, "PLAN_CHECK_PROXY_MODE", "auto") or "auto").strip().lower()
     if mode not in {"auto", "proxy", "direct"}:
         raise ValueError(f"PLAN_CHECK_PROXY_MODE={mode!r} 无效，可选 auto / proxy / direct")

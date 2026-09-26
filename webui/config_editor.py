@@ -399,6 +399,14 @@ EDITABLE_FIELDS = [
         "label": "Outlook取件模式", "help": "auto=远端优先，远端 402/DEPLOYMENT_DISABLED 自动切 Graph 直连；direct=只用 Microsoft Graph 直连；remote=只用远端服务",
     },
     {
+        "key": "OUTLOOK_GRAPH_FOLDERS", "file": "email.py", "type": "list_str_multiline", "group": "邮箱 / OTP",
+        "label": "Outlook Graph 文件夹", "help": "每行一个：inbox、junkemail、deleteditems；默认扫描这三个文件夹",
+    },
+    {
+        "key": "OUTLOOK_TOKEN_AUTO_ROTATE", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
+        "label": "自动保存最新 refresh_token", "help": "Microsoft 换 access_token 返回新 refresh_token 时，自动写回邮箱池和已注册账号",
+    },
+    {
         "key": "EMAIL_DOMAIN", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "转发域名(cloudflare_domain)", "help": "仅 cloudflare_domain 使用：Email Routing 的域名，如 mydomain.com；与 EMAIL_SOURCE=cloudflare 无关",
     },

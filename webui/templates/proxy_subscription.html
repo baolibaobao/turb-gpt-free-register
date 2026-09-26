@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>订阅与节点 · 项目代理</title>
+  <style>
+    :root{color-scheme:dark;--bg:#10151e;--panel:#19212d;--line:#303e51;--text:#eef3fa;--muted:#a9b8cc;--accent:#92c6ff}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.65 system-ui,"Microsoft YaHei",sans-serif}
+    main{max-width:1000px;margin:auto;padding:36px 22px 60px}a{color:var(--accent)}h1{font-size:28px;margin:18px 0 4px}h2{font-size:18px;margin:0 0 12px}p{margin:8px 0;color:var(--muted)}
+    section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px;margin-top:20px}.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}.grow{flex:1;min-width:200px}
+    input,select,button{font:inherit;border-radius:8px;border:1px solid var(--line);padding:10px 12px}input,select{width:100%;background:#101822;color:var(--text)}label{display:block;margin:14px 0 5px;color:var(--muted)}button{background:#28364b;color:var(--text);cursor:pointer}button.primary{background:var(--accent);color:#102033;border-color:var(--accent);font-weight:650}button:disabled{opacity:.5;cursor:wait}button:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+    .status{display:inline-block;border-radius:30px;padding:4px 12px;background:#29364b}.status.on{background:#173e34;color:#99e5c4}.small{font-size:13px}#message{white-space:pre-wrap;margin:18px 0;padding:12px 16px;background:#25374e;border-radius:8px}#message:empty{display:none}#message.error{background:#4b2930;color:#ffd6da}.stats{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px}.stats div{padding:12px;background:#121b28;border-radius:8px;overflow-wrap:anywhere}.stats span{display:block;color:var(--muted);font-size:13px}details{margin-top:18px}summary{cursor:pointer;color:var(--muted)}.actions{margin-top:18px}#warnings{white-space:pre-wrap;color:#edca85;max-height:150px;overflow:auto}code{overflow-wrap:anywhere} @media(max-width:600px){main{padding:22px 14px}section{padding:18px}.stats{grid-template-columns:1fr}.row button{flex:1}}
+  </style>
+</head>
+<body><main>
+  <a href="/">← 返回控制台</a>
+  <h1>订阅与节点</h1>
+  <p>在项目里导入订阅、选择出口。项目使用独立 Mihomo 核心，节点选择与其他代理软件各自独立。</p>
+  <div id="message" role="status" aria-live="polite"></div>
+  <section aria-labelledby="runtime-heading">
+    <div class="row"><h2 id="runtime-heading" class="grow">项目代理</h2><span class="status" id="status">正在读取…</span></div>
+    <div class="stats"><div><span>当前节点</span><strong id="current">—</strong></div><div><span>项目入口</span><code id="endpoint">—</code></div></div>
+    <p class="small" id="coreStatus"></p>
+    <div class="row actions"><button class="primary" id="enable">启用项目代理</button><button id="test">测试出口 IP</button><button id="disable">停用项目代理</button><button id="reload">刷新状态</button></div>
+    <p class="small">启用后，默认网络请求、套餐查询、本机 CloakBrowser 和新建 Roxy 环境使用此节点。停用后恢复原有代理配置。任务结束后再切换节点。</p>
+  </section>
+  <section aria-labelledby="subscription-heading">
+    <h2 id="subscription-heading">1. 导入订阅</h2>
+    <label for="url">订阅链接</label>
+    <input id="url" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 HTTP / HTTPS 订阅链接">
+    <p class="small" id="saved">支持 Clash / Mihomo YAML、JSON 以及常见 URI / Base64 订阅。推荐选择 Clash / Mihomo 格式。</p>
+    <div class="row"><div class="grow"><label for="downloadMode">订阅下载方式</label><select id="downloadMode"><option value="direct">直接连接订阅服务器</option><option value="managed">通过当前项目节点下载（需先启用缓存节点）</option></select></div><button class="primary" id="refresh" style="align-self:end">保存并刷新订阅</button></div>
+    <p class="small" id="updated"></p><div id="warnings" class="small"></div>
+  </section>
+  <section aria-labelledby="nodes-heading">
+    <h2 id="nodes-heading">2. 选择节点</h2>
+    <label for="search">搜索节点</label><input id="search" type="search" placeholder="输入地区、名称或协议">
+    <label for="nodes">节点列表 <span id="count"></span></label><select id="nodes"><option value="">请先导入订阅</option></select>
+    <div class="row actions"><button class="primary" id="select">保存节点选择</button></div>
+    <p class="small">首次使用：导入订阅 → 保存节点选择 → 启用项目代理 → 测试出口 IP。节点不会自动轮换。</p>
+  </section>
+  <section>
+    <h2>使用说明</h2>
+    <p>双击项目的一键启动 BAT，已启用的节点会自动恢复。首次导入需要能连接订阅服务器；也可以在已有节点启用后，通过该节点刷新订阅。</p>
+    <p>本机 Roxy 请新建环境。远程浏览器或复用的 Roxy 环境需要另行配置其网络；项目入口只监听本机。</p>
+    <p class="small">订阅链接和节点凭据保存在本机 <code>run/mihomo/</code>，该目录已排除 Git 提交。请妥善保管这个目录。</p>
+    <details><summary>高级：独立端口</summary><p class="small">仅在端口冲突时调整，保存前先停用项目代理。</p><div class="row"><div class="grow"><label for="mixedPort">代理端口</label><input id="mixedPort" type="number" min="1024" max="65535"></div><div class="grow"><label for="controllerPort">控制端口</label><input id="controllerPort" type="number" min="1024" max="65535"></div></div><button id="ports" class="actions">保存端口</button></details>
+  </section>
+</main><script src="{{ url_for('static', filename='proxy_subscription.js') }}" defer></script></body>
+</html>

@@ -2482,6 +2482,7 @@
   <div id="tab-config" class="hidden">
     <div class="config-overview-v2" id="configOverviewV2" aria-label="配置概览">
       <h1 class="config-overview-v2-title">运行配置</h1>
+      <p><a class="btn primary" href="/proxy-subscription">订阅与节点 · 独立 Mihomo</a></p>
       <p class="config-overview-v2-desc">仅开放运行时安全的开关与数值。协议级常量（client_id / sentinel 版本）不在此处，避免误改废号。修改后点保存即可热加载生效，无需重启。</p>
     </div>
 
@@ -2504,9 +2505,9 @@
             <div class="config-card-v2-hint" id="configCardRegistrationHintV2">驱动标识: —</div>
           </div>
           <div class="config-card-v2">
-            <div class="config-card-v2-label">占位卡片 2</div>
-            <div class="config-card-v2-value is-placeholder">—</div>
-            <div class="config-card-v2-hint">内容稍后完善</div>
+            <div class="config-card-v2-label">项目代理订阅</div>
+            <div class="config-card-v2-value"><a href="/proxy-subscription">管理节点 →</a></div>
+            <div class="config-card-v2-hint">导入订阅，在项目内独立选择出口</div>
           </div>
           <div class="config-card-v2">
             <div class="config-card-v2-label">占位卡片 3</div>
@@ -2567,6 +2568,10 @@
       <label class="outlook-import-check">
         <input id="importAsRegisteredV2" type="checkbox">
         <span>导入后默认视为「注册成功账号」（邮箱池标记已用，并出现在账号页，可直接批量补跑 Codex）</span>
+      </label>
+      <label class="outlook-import-check" id="updateExistingOutlookWrapV2">
+        <input id="updateExistingOutlookV2" type="checkbox">
+        <span>同邮箱已存在时更新 Outlook 凭据（用于写入最新 refresh_token）</span>
       </label>
       <label class="outlook-import-field">
         <span>邮箱素材</span>
@@ -5220,9 +5225,13 @@ function _outlookTokenCell(r) {
 function _outlookMoreMenu(r) {
   const src = esc(r.source || getPoolSource() || 'all');
   const email = esc(r.email);
+  const refreshButton = (r.source || getPoolSource()) === 'outlook'
+    ? `<button type="button" data-pool-act="refresh-token" data-email="${email}" data-source="${src}" title="用当前 refresh_token 主动换取 access_token，并保存微软返回的新 refresh_token">刷新 refresh_token</button>`
+    : '';
   const items = [
     cbtn('复制Token', r.access_token, 'good'),
     cbtn('复制整行', r.account_copy_line, 'good'),
+    refreshButton,
     r.status !== 'available' ? `<button type="button" data-pool-act="available" data-email="${email}" data-source="${src}">恢复可用</button>` : '',
     r.status !== 'disabled' ? `<button type="button" data-pool-act="disabled" data-email="${email}" data-source="${src}">停用</button>` : '',
     r.status !== 'failed' ? `<button type="button" data-pool-act="failed" data-email="${email}" data-source="${src}">标失败</button>` : '',
@@ -5342,6 +5351,14 @@ async function onOutlookBodyClick(e) {
       }
       OUTLOOK_SELECTED.delete(`${source}|${email}`);
       showToast('已删除');
+    } else if (poolAct === 'refresh-token') {
+      t.disabled = true;
+      const r = await api('/api/outlook/refresh', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({email}),
+      });
+      showToast(r.rotated ? '刷新成功：已保存新的 refresh_token' : '刷新成功：当前 refresh_token 仍有效');
     } else {
       const noteMap = {failed:'手动标记失败', available:'手动恢复可用', disabled:'手动停用'};
       await api('/api/outlook/status', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({email, status: poolAct, source, note: noteMap[poolAct] || '手动修改状态'}) });
@@ -5427,6 +5444,11 @@ function setImportSourceV2(val) {
     imapSettings.classList.toggle('hidden', next !== 'imap');
     imapSettings.style.display = next === 'imap' ? 'grid' : 'none';
   }
+  const updateWrap = document.getElementById('updateExistingOutlookWrapV2');
+  if (updateWrap) {
+    updateWrap.classList.toggle('hidden', next !== 'outlook');
+    updateWrap.style.display = next === 'outlook' ? 'flex' : 'none';
+  }
   const text = document.getElementById('importTextV2');
   if (text) text.placeholder = next === 'imap'
     ? 'user@example.com----imapPassword\nuser2@example.com:imapPassword'
@@ -5507,7 +5529,9 @@ async function doImportOutlook() {
   try {
     const source = sourceEl ? sourceEl.value : 'outlook';
     const as_registered = registeredEl ? !!registeredEl.checked : false;
-    const payload = {text, source, as_registered};
+    const updateExistingEl = $('#updateExistingOutlookV2');
+    const update_existing = source === 'outlook' && !as_registered && updateExistingEl ? !!updateExistingEl.checked : false;
+    const payload = {text, source, as_registered, update_existing};
     if (source === 'imap') {
       payload.imap_server = ($('#imapServerV2')?.value || '').trim();
       payload.imap_port = Number($('#imapPortV2')?.value || 993);
@@ -5516,13 +5540,14 @@ async function doImportOutlook() {
     }
     const r = await api('/api/outlook/import', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const mode = r.as_registered ? '已注册账号' : '邮箱池素材';
-    const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
+    const updated = Number(r.updated || 0);
+    const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}，更新 ${updated}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
     if (resultEl) resultEl.innerHTML = `<div class="banner info">${esc(msg)}</div>`;
     if (textEl) textEl.value = '';
     setPoolSourceV2(source);
     setImportSourceV2(source);
     loadOutlook(); loadAccounts(); loadSummary();
-    showToast(`导入完成：新增 ${r.inserted}，跳过 ${r.skipped}`);
+    showToast(`导入完成：新增 ${r.inserted}，更新 ${updated}，跳过 ${r.skipped}`);
     setTimeout(closeOutlookImportModal, 600);
   } catch(e) {
     if (resultEl) resultEl.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`;

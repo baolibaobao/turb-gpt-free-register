@@ -405,9 +405,9 @@ class BrowserSession:
                     with _GEO_CACHE_LOCK:
                         _GEO_CACHE[cache_key] = dict(geo)
                     logger.info(
-                        "[指纹] 出口IP地理信息: ip=%s country=%s city=%s timezone=%s",
+                        "[指纹] 出口IP地理信息: ip=%s country=%s city=%s timezone=%s org=%s",
                         geo.get("ip") or "?", geo.get("country") or "?",
-                        geo.get("city") or "?", geo.get("timezone") or "?",
+                        geo.get("city") or "?", geo.get("timezone") or "?", geo.get("org") or "?",
                     )
                     return geo
             except Exception as exc:
@@ -767,7 +767,9 @@ class BrowserSession:
         cool_down = retry_after if retry_after > 0 else (300 if status == 429 else 900)
         self.blocked_until = max(self.blocked_until, time.time() + min(cool_down, 3600))
         self.blocked_reason = f"HTTP {status} from {url}"
-        logger.warning("[熔断] 当前会话收到 HTTP %s，进入冷却 %ss，停止后续请求：%s", status, min(cool_down, 3600), url)
+        cf_mitigated = str(getattr(resp, "headers", {}).get("cf-mitigated", "") or "").strip()
+        suffix = f"，cf-mitigated={cf_mitigated}" if cf_mitigated else ""
+        logger.warning("[熔断] 当前会话收到 HTTP %s，进入冷却 %ss%s，停止后续请求：%s", status, min(cool_down, 3600), suffix, url)
         return resp
 
     def get(self, url: str, headers: dict = None, **kwargs):
