@@ -361,10 +361,11 @@ def invalidate_account_context(email: str) -> None:
 
 
 def refresh_account_token(email: str) -> dict:
-    """主动用当前 Outlook refresh_token 换取 access_token。
+    """主动刷新当前 Outlook OAuth 凭据。
 
-    Microsoft 若在响应中轮换 refresh_token，``_ms_access_token`` 会立即持久化新值；
-    返回值只包含状态和 token 类型，不返回任何 token 内容。
+    配置了 FYUI 收件 API 时先走该 API，因为它能同时完成邮箱 OAuth 校验和
+    refresh_token 轮换；否则使用 Microsoft 端点。返回值只包含状态，不返回
+    任何 token 内容。
     """
     account = get_account_context(email)
     if account is None:
@@ -372,6 +373,29 @@ def refresh_account_token(email: str) -> dict:
 
     old_refresh = str(account.refresh_token or "").strip()
     _clear_ms_token_cache(account)
+
+    mode = _outlook_fetch_mode()
+    if mode in ("auto", "fyui", "api", "fetch_api", "outlook_api") and _fyui_api_url():
+        fyui_http = _http_session(_fyui_api_url())
+        try:
+            _fetch_via_fyui(fyui_http, account)
+            new_refresh = str(account.refresh_token or "").strip()
+            return {
+                "email": account.email,
+                "kind": "fyui",
+                "rotated": bool(new_refresh and new_refresh != old_refresh),
+                "access_token_obtained": True,
+            }
+        except Exception as exc:
+            if mode != "auto":
+                raise
+            logger.warning(
+                "[Outlook] FYUI 主动刷新失败，回退 Microsoft 端点：%s: %s",
+                type(exc).__name__, str(exc)[:220],
+            )
+        finally:
+            fyui_http.close()
+
     http = _ms_http()
     try:
         token, kind = _ms_access_token(account, http=http)

@@ -224,6 +224,7 @@ class OutlookClientContextTests(unittest.TestCase):
         self.assertEqual([row["folder"] for row in rows], ["inbox", "junkemail", "deleteditems"])
         self.assertEqual(fetch_messages.call_count, 3)
 
+    @patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_MODE", "direct")
     @patch.object(outlook_client, "_ms_http")
     @patch.object(outlook_client, "_ms_access_token", return_value=("access-token", "graph"))
     @patch.object(outlook_client, "get_account_context")
@@ -249,6 +250,26 @@ class OutlookClientContextTests(unittest.TestCase):
             "access_token_obtained": True,
         })
         access_token.assert_called_once_with(account, http=ms_http.return_value)
+
+    def test_manual_refresh_prefers_fyui_api_when_configured(self):
+        class _Http:
+            def close(self):
+                pass
+
+        account = outlook_client.OutlookAccount(
+            "manual-fyui@outlook.test", "password", "client", "refresh"
+        )
+        with patch.object(outlook_client, "get_account_context", return_value=account), \
+             patch.object(outlook_client._email_cfg, "OUTLOOK_FETCH_MODE", "fyui"), \
+             patch.object(outlook_client, "_fyui_api_url", return_value="https://fyui.test/api/fetch"), \
+             patch.object(outlook_client, "_http_session", return_value=_Http()) as make_session, \
+             patch.object(outlook_client, "_fetch_via_fyui", return_value=[] ) as fetch:
+            result = outlook_client.refresh_account_token(account.email)
+
+        self.assertEqual(result["kind"], "fyui")
+        self.assertTrue(result["access_token_obtained"])
+        make_session.assert_called_once_with("https://fyui.test/api/fetch")
+        fetch.assert_called_once_with(make_session.return_value, account)
 
 
 if __name__ == "__main__":
